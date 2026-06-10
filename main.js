@@ -5,6 +5,9 @@ const fs = require('fs');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
+// Store main window reference for progress updates
+let mainWindow = null;
+
 // Fix module resolution for unpacked modules in ASAR
 if (app.isPackaged && process.resourcesPath) {
   const unpackedPath = path.join(process.resourcesPath, 'app.asar.unpacked');
@@ -232,20 +235,53 @@ async function embedArtworkToFile(filePath, artworkPath) {
   try {
     const ffmpegPath = getFfmpegPath();
     console.log('Embedding artwork using ffmpeg...');
+    console.log('File extension:', fileExt);
     
-    // Use ffmpeg to embed artwork
-    const ffmpegArgs = [
-      '-i', filePath,
-      '-i', artworkPath,
-      '-map', '0:a', // Map audio stream
-      '-map', '1', // Map image stream
-      '-c', 'copy', // Copy codec (no re-encoding for audio)
-      '-c:v', 'mjpeg', // Codec for image
-      '-disposition:v', 'attached_pic', // Set image as attached picture
-      '-y', // Overwrite
-      tempPath
-    ];
+    // For M4A/MP4/AAC files, use mp4 format and ensure proper codec settings
+    let ffmpegArgs = [];
     
+    if (fileExt === '.m4a' || fileExt === '.mp4' || fileExt === '.aac') {
+      // For M4A/MP4, use mp4 format with proper codec settings
+      ffmpegArgs = [
+        '-i', filePath,
+        '-i', artworkPath,
+        '-map', '0:a', // Map audio stream
+        '-map', '1:v', // Map video/image stream
+        '-c:a', 'copy', // Copy audio codec (no re-encoding)
+        '-c:v', 'mjpeg', // Codec for image
+        '-disposition:v', 'attached_pic', // Set image as attached picture
+        '-f', 'mp4', // Force mp4 format
+        '-y', tempPath
+      ];
+    } else if (fileExt === '.mp3') {
+      // For MP3, use mp3 format
+      ffmpegArgs = [
+        '-i', filePath,
+        '-i', artworkPath,
+        '-map', '0:a',
+        '-map', '1:v',
+        '-c:a', 'copy',
+        '-c:v', 'mjpeg',
+        '-disposition:v', 'attached_pic',
+        '-f', 'mp3',
+        '-id3v2_version', '3', // Use ID3v2.3 for better compatibility
+        '-y', tempPath
+      ];
+    } else {
+      // For other formats, try without explicit format
+      ffmpegArgs = [
+        '-i', filePath,
+        '-i', artworkPath,
+        '-map', '0:a',
+        '-map', '1:v',
+        '-c:a', 'copy',
+        '-c:v', 'mjpeg',
+        '-disposition:v', 'attached_pic',
+        '-y', tempPath
+      ];
+    }
+    
+    console.log('FFmpeg command:', ffmpegPath, ffmpegArgs.join(' '));
     await execFileAsync(ffmpegPath, ffmpegArgs);
     
     // Replace original file with temp file
@@ -303,48 +339,239 @@ async function writeMetadataToFile(filePath, metadata) {
     console.log('Using ffmpeg for metadata writing at:', ffmpegPath);
     
     // Use ffmpeg to write metadata
-    const ffmpegArgs = [
-      '-i', filePath,
-      '-c', 'copy', // Copy codec (no re-encoding)
-      '-metadata', `title=${metadata.title || ''}`,
-      '-metadata', `artist=${metadata.artist || ''}`
-    ];
+    // For M4A with artwork, we need a specific approach
+    const ffmpegArgs = [];
     
-    // Add artwork if provided
-    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath)) {
+    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath) && (fileExt === '.m4a' || fileExt === '.mp4' || fileExt === '.aac')) {
+      // Special handling for M4A/MP4 with artwork
+      // For M4A, we need a different approach - use loop input for artwork
+      
+      // Input files - audio first, then artwork (looped to ensure it's treated as video)
+      ffmpegArgs.push('-i', filePath);
+      ffmpegArgs.push('-loop', '1');
       ffmpegArgs.push('-i', metadata.artworkPath);
+      
+      // Map streams - audio from input 0, video (artwork) from input 1
       ffmpegArgs.push('-map', '0:a');
-      ffmpegArgs.push('-map', '1');
+      ffmpegArgs.push('-map', '1:v');
+      
+      // Codecs - copy audio, encode artwork as mjpeg
+      ffmpegArgs.push('-c:a', 'copy');
       ffmpegArgs.push('-c:v', 'mjpeg');
+      
+      // Set artwork as attached picture (critical for M4A/MP4)
       ffmpegArgs.push('-disposition:v', 'attached_pic');
-    }
-    
-    // Add BPM metadata (TBPM tag for ID3v2)
-    if (metadata.bpm) {
-      if (fileExt === '.mp3') {
-        // For MP3, use TBPM tag
-        ffmpegArgs.push('-metadata', `TBPM=${Math.round(metadata.bpm)}`);
-      } else {
-        // For other formats, use bpm tag
+      
+      // Remove any existing chapters to avoid conflicts
+      ffmpegArgs.push('-map_chapters', '-1');
+      
+      // Set short duration for artwork (1 frame is enough)
+      ffmpegArgs.push('-shortest');
+      
+      // Metadata for the file
+      ffmpegArgs.push('-metadata', `title=${(metadata.title || '').replace(/:/g, '\\:')}`);
+      ffmpegArgs.push('-metadata', `artist=${(metadata.artist || '').replace(/:/g, '\\:')}`);
+      
+      if (metadata.bpm) {
         ffmpegArgs.push('-metadata', `bpm=${Math.round(metadata.bpm)}`);
+      }
+      
+      if (metadata.key) {
+        ffmpegArgs.push('-metadata', `initialkey=${metadata.key}`);
+      }
+      
+      // Format and output options for M4A
+      // Use mp4 format (M4A is essentially MP4 with audio)
+      ffmpegArgs.push('-f', 'mp4');
+      ffmpegArgs.push('-movflags', '+faststart');
+      // Ensure proper atom structure for M4A
+      ffmpegArgs.push('-brand', 'M4A ');
+    } else {
+      // Standard approach for files without artwork or other formats
+      ffmpegArgs.push('-i', filePath);
+      
+      // Add artwork as second input if provided (for non-M4A formats)
+      if (metadata.artworkPath && fs.existsSync(metadata.artworkPath)) {
+        ffmpegArgs.push('-i', metadata.artworkPath);
+        ffmpegArgs.push('-map', '0:a');
+        ffmpegArgs.push('-map', '1');
+        ffmpegArgs.push('-c:a', 'copy');
+        ffmpegArgs.push('-c:v', 'copy');
+        ffmpegArgs.push('-disposition:v', 'attached_pic');
+      } else {
+        ffmpegArgs.push('-c', 'copy');
+      }
+      
+      // Metadata
+      ffmpegArgs.push('-metadata', `title=${(metadata.title || '').replace(/:/g, '\\:')}`);
+      ffmpegArgs.push('-metadata', `artist=${(metadata.artist || '').replace(/:/g, '\\:')}`);
+      
+      if (metadata.bpm) {
+        if (fileExt === '.mp3') {
+          ffmpegArgs.push('-metadata', `TBPM=${Math.round(metadata.bpm)}`);
+        } else {
+          ffmpegArgs.push('-metadata', `bpm=${Math.round(metadata.bpm)}`);
+        }
+      }
+      
+      if (metadata.key) {
+        ffmpegArgs.push('-metadata', `initialkey=${metadata.key}`);
+      }
+      
+      // Format
+      if (fileExt === '.mp3') {
+        ffmpegArgs.push('-f', 'mp3');
+        ffmpegArgs.push('-id3v2_version', '3');
+      } else if (fileExt === '.flac') {
+        ffmpegArgs.push('-f', 'flac');
+      } else if (fileExt === '.ogg' || fileExt === '.oga') {
+        ffmpegArgs.push('-f', 'ogg');
       }
     }
     
-    // Add Key metadata
-    if (metadata.key) {
-      ffmpegArgs.push('-metadata', `initialkey=${metadata.key}`);
-      // Also add as comment for compatibility
-      ffmpegArgs.push('-metadata', `comment=Key: ${metadata.key}`);
+    // Output to temp file
+    ffmpegArgs.push('-y', tempPath); // Overwrite output file
+    
+    // Log the command for debugging
+    console.log('FFmpeg command for metadata:', ffmpegPath, ffmpegArgs.join(' '));
+    console.log('Artwork path exists:', metadata.artworkPath ? fs.existsSync(metadata.artworkPath) : 'N/A');
+    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath)) {
+      const artworkStats = fs.statSync(metadata.artworkPath);
+      console.log('Artwork file size:', artworkStats.size, 'bytes');
     }
     
-    // Output to temp file
-    ffmpegArgs.push('-y'); // Overwrite output file
-    ffmpegArgs.push(tempPath);
+    // Remove temp file if it exists from previous run
+    if (fs.existsSync(tempPath)) {
+      fs.unlinkSync(tempPath);
+    }
     
-    await execFileAsync(ffmpegPath, ffmpegArgs);
+    // For M4A with artwork, also check if original file has artwork and remove it first
+    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath) && (fileExt === '.m4a' || fileExt === '.mp4' || fileExt === '.aac')) {
+      // Check if original file already has artwork stream
+      try {
+        let ffprobePath = getFfmpegPath().replace('ffmpeg', 'ffprobe');
+        if (!fs.existsSync(ffprobePath)) {
+          const commonProbePaths = ['ffprobe', '/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe', '/usr/bin/ffprobe'];
+          for (const probePath of commonProbePaths) {
+            if (fs.existsSync(probePath)) {
+              ffprobePath = probePath;
+              break;
+            }
+          }
+        }
+        if (fs.existsSync(ffprobePath)) {
+          const probeArgs = ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', filePath];
+          const { stdout: probeStdout } = await execFileAsync(ffprobePath, probeArgs);
+          if (probeStdout && probeStdout.toString().trim()) {
+            console.log('Original file already has artwork stream, will be replaced');
+          }
+        }
+      } catch (probeError) {
+        // Ignore probe errors
+      }
+    }
+    
+    const { stdout, stderr } = await execFileAsync(ffmpegPath, ffmpegArgs);
+    
+    // Log output for debugging
+    if (stdout) {
+      console.log('FFmpeg stdout:', stdout.toString().substring(0, 200));
+    }
+    if (stderr) {
+      const stderrStr = stderr.toString();
+      console.log('FFmpeg stderr (first 500 chars):', stderrStr.substring(0, 500));
+      // Check for errors in stderr
+      if (stderrStr.toLowerCase().includes('error') && !stderrStr.toLowerCase().includes('non-strictly')) {
+        console.log('FFmpeg error detected in stderr');
+      }
+    }
+    
+    // Verify temp file was created
+    if (!fs.existsSync(tempPath)) {
+      throw new Error('FFmpeg did not create output file');
+    }
+    
+    const tempStats = fs.statSync(tempPath);
+    console.log('Temp file created, size:', tempStats.size, 'bytes');
+    
+    // Verify original file exists
+    if (!fs.existsSync(filePath)) {
+      throw new Error('Original file does not exist');
+    }
+    const originalStats = fs.statSync(filePath);
+    console.log('Original file size:', originalStats.size, 'bytes');
+    
+    // Calculate size difference
+    const sizeDiff = tempStats.size - originalStats.size;
+    console.log('Size difference (temp - original):', sizeDiff, 'bytes');
+    
+    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath) && sizeDiff <= 0) {
+      console.log('WARNING: File size did not increase after embedding artwork! This may indicate artwork was not embedded.');
+      console.log('Artwork file size:', fs.statSync(metadata.artworkPath).size, 'bytes');
+    }
     
     // Replace original file with temp file
+    // Remove original first to ensure clean overwrite
+    console.log('Removing original file before rename...');
+    fs.unlinkSync(filePath);
+    console.log('Renaming temp file to original...');
     fs.renameSync(tempPath, filePath);
+    
+    // Verify final file exists and has content
+    if (!fs.existsSync(filePath)) {
+      throw new Error('Final file does not exist after rename');
+    }
+    const finalStats = fs.statSync(filePath);
+    console.log('Final file size:', finalStats.size, 'bytes');
+    
+    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath) && finalStats.size <= originalStats.size) {
+      console.log('WARNING: Final file size is not larger than original. Artwork may not have been embedded correctly.');
+    }
+    
+    // If artwork was embedded, verify it's in the file
+    if (metadata.artworkPath && fs.existsSync(metadata.artworkPath) && (fileExt === '.m4a' || fileExt === '.mp4' || fileExt === '.aac')) {
+      try {
+        // Use ffprobe to check if artwork is embedded
+        let ffprobePath = getFfmpegPath().replace('ffmpeg', 'ffprobe');
+        // If replacement didn't work, try common paths
+        if (!fs.existsSync(ffprobePath)) {
+          const commonProbePaths = [
+            'ffprobe',
+            '/opt/homebrew/bin/ffprobe',
+            '/usr/local/bin/ffprobe',
+            '/usr/bin/ffprobe'
+          ];
+          for (const probePath of commonProbePaths) {
+            if (fs.existsSync(probePath)) {
+              ffprobePath = probePath;
+              break;
+            }
+          }
+        }
+        if (fs.existsSync(ffprobePath)) {
+          const probeArgs = [
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            filePath
+          ];
+          try {
+            const { stdout: probeStdout } = await execFileAsync(ffprobePath, probeArgs);
+            if (probeStdout && probeStdout.toString().trim()) {
+              console.log('Artwork stream found in file:', probeStdout.toString().trim());
+            } else {
+              console.log('WARNING: No artwork stream found in file!');
+            }
+          } catch (probeError) {
+            console.log('Could not verify artwork with ffprobe:', probeError.message);
+          }
+        }
+      } catch (verifyError) {
+        console.log('Error verifying artwork:', verifyError.message);
+      }
+    }
+    
     console.log('Metadata written successfully using ffmpeg');
   } catch (error) {
     // If ffmpeg fails, try using node-id3 for MP3 files
@@ -554,6 +781,9 @@ function createWindow() {
   win.webContents.on('console-message', (event, level, message) => {
     console.log(`[Renderer ${level}]:`, message);
   });
+  
+  // Store window reference for progress updates
+  mainWindow = win;
 }
 
 app.whenReady().then(createWindow);
@@ -636,9 +866,54 @@ function getAubioPath() {
   return 'aubio';
 }
 
+// Helper function to clean SoundCloud URL from unnecessary query parameters
+function cleanSoundCloudUrl(url) {
+  if (!url || typeof url !== 'string') {
+    console.log('Invalid URL provided, returning as-is');
+    return url;
+  }
+  
+  try {
+    // Basic validation - check if it looks like a URL
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      console.log('URL does not start with http:// or https://, returning as-is');
+      return url;
+    }
+    
+    const urlObj = new URL(url);
+    // Remove unnecessary query parameters that might cause issues with yt-dlp
+    const paramsToRemove = ['si', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref', 'fbclid', 'gclid'];
+    let hasRemovedParams = false;
+    paramsToRemove.forEach(param => {
+      if (urlObj.searchParams.has(param)) {
+        urlObj.searchParams.delete(param);
+        hasRemovedParams = true;
+      }
+    });
+    
+    // Return clean URL
+    const cleanUrl = urlObj.toString();
+    if (hasRemovedParams) {
+      console.log('Removed query parameters from URL');
+    }
+    return cleanUrl;
+  } catch (error) {
+    // If URL parsing fails, return original URL
+    console.log('Error parsing URL, using original:', error.message);
+    return url;
+  }
+}
+
 // Handler untuk menambahkan track SoundCloud
 ipcMain.handle('soundcloud:add', async (_, url) => {
   try {
+    // Clean URL from unnecessary query parameters
+    const cleanUrl = cleanSoundCloudUrl(url);
+    if (cleanUrl !== url) {
+      console.log('Cleaned URL from:', url);
+      console.log('Cleaned URL to:', cleanUrl);
+    }
+    
     const ytDlpPath = getYtDlpPath();
     console.log('Using yt-dlp at:', ytDlpPath);
     
@@ -650,16 +925,32 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
 
     // Pertama, dapatkan info track tanpa download
     // Include playlist/album info to get album artwork
+    // Note: We don't use --write-thumbnail here to avoid writing to read-only filesystem
+    // Instead, we extract thumbnail URL from JSON and download it separately
     const infoArgs = [
       '--print-json',
       '--no-download',
       '--flat-playlist',
       '--yes-playlist',
-      url
+      cleanUrl
     ];
 
-    const { stdout: infoStdout } = await execFileAsync(ytDlpPath, infoArgs);
-    const info = JSON.parse(infoStdout);
+    let info;
+    try {
+      const { stdout: infoStdout } = await execFileAsync(ytDlpPath, infoArgs);
+      info = JSON.parse(infoStdout);
+    } catch (infoError) {
+      console.error('Error getting track info:', infoError);
+      console.error('URL used:', cleanUrl);
+      // Provide more helpful error message
+      if (infoError.message && infoError.message.includes('JSON')) {
+        throw new Error(`Failed to get track information. The URL might be invalid or the track might be unavailable. Original error: ${infoError.message}`);
+      } else if (infoError.message && (infoError.message.includes('yt-dlp') || infoError.message.includes('not found'))) {
+        throw new Error(`yt-dlp not found or not working. Please ensure yt-dlp is installed and accessible. Original error: ${infoError.message}`);
+      } else {
+        throw new Error(`Failed to process SoundCloud URL. Please check if the URL is valid and the track is available. Original error: ${infoError.message || infoError}`);
+      }
+    }
 
     // Download track - coba dengan format yang tersedia tanpa conversion dulu
     // Jika perlu conversion, akan error dan kita handle
@@ -669,7 +960,7 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
       '--audio-quality', '0',
       '--prefer-ffmpeg',
       '-o', path.join(outputDir, `${info.id}.%(ext)s`),
-      url
+      cleanUrl
     ];
 
     // Get files before download
@@ -677,6 +968,16 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
     if (fs.existsSync(outputDir)) {
       const existingFiles = fs.readdirSync(outputDir);
       existingFiles.forEach(f => filesBefore.add(f));
+    }
+    
+    // Delete existing file with same ID to ensure fresh download
+    const possibleExtensions = ['mp3', 'm4a', 'mp4', 'aac', 'ogg', 'flac', 'opus', 'webm'];
+    for (const ext of possibleExtensions) {
+      const existingFile = path.join(outputDir, `${info.id}.${ext}`);
+      if (fs.existsSync(existingFile)) {
+        console.log(`Deleting existing file: ${existingFile}`);
+        fs.unlinkSync(existingFile);
+      }
     }
     
     try {
@@ -689,7 +990,7 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
           '-x',
           '-f', 'bestaudio',
           '-o', path.join(outputDir, `${info.id}.%(ext)s`),
-          url
+          cleanUrl
         ];
         await execFileAsync(ytDlpPath, originalArgs);
       } else {
@@ -865,62 +1166,267 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
     let artworkPath = null;
     let thumbnailUrl = null;
     
-    // Try multiple sources for artwork
-    // 1. Try track thumbnail
+    // Helper function to extract URL from thumbnail object or string
+    const extractThumbnailUrl = (thumb) => {
+      if (!thumb) return null;
+      if (typeof thumb === 'string') return thumb;
+      if (thumb.url) return thumb.url;
+      if (thumb.id) {
+        // SoundCloud sometimes uses ID-based URLs
+        return `https://i1.sndcdn.com/artworks-${thumb.id}-large.jpg`;
+      }
+      return null;
+    };
+    
+    // Try multiple sources for artwork with comprehensive fallbacks
+    // 1. Try track thumbnail (direct)
     if (info.thumbnail) {
-      thumbnailUrl = info.thumbnail;
+      thumbnailUrl = extractThumbnailUrl(info.thumbnail);
     }
+    
     // 2. Try thumbnails array (usually has higher quality)
-    else if (info.thumbnails && Array.isArray(info.thumbnails) && info.thumbnails.length > 0) {
-      // Get the highest quality thumbnail (usually the last one)
-      const bestThumbnail = info.thumbnails[info.thumbnails.length - 1];
-      thumbnailUrl = bestThumbnail.url || bestThumbnail;
+    if (!thumbnailUrl && info.thumbnails) {
+      if (Array.isArray(info.thumbnails) && info.thumbnails.length > 0) {
+        // Try all thumbnails from highest to lowest quality
+        for (let i = info.thumbnails.length - 1; i >= 0; i--) {
+          const thumb = info.thumbnails[i];
+          const url = extractThumbnailUrl(thumb);
+          if (url) {
+            thumbnailUrl = url;
+            break;
+          }
+        }
+      } else if (typeof info.thumbnails === 'object') {
+        // Sometimes thumbnails is an object with quality keys
+        thumbnailUrl = extractThumbnailUrl(info.thumbnails.large || info.thumbnails.default || info.thumbnails.medium);
+      }
     }
-    // 3. Try album/playlist artwork if available
-    else if (info.album) {
-      thumbnailUrl = info.album.thumbnail || (info.album.thumbnails && info.album.thumbnails.length > 0 ? info.album.thumbnails[info.album.thumbnails.length - 1].url : null);
+    
+    // 3. Try artwork field (SoundCloud specific)
+    if (!thumbnailUrl && info.artwork_url) {
+      thumbnailUrl = info.artwork_url;
     }
-    // 4. Try playlist artwork if track is in a playlist
-    else if (info.playlist && info.playlist.thumbnail) {
-      thumbnailUrl = info.playlist.thumbnail;
+    
+    // 4. Try track artwork_url (SoundCloud)
+    if (!thumbnailUrl && info.track && info.track.artwork_url) {
+      thumbnailUrl = info.track.artwork_url;
     }
-    // 5. Try uploader/artist artwork as last resort
-    else if (info.uploader_thumbnail) {
-      thumbnailUrl = info.uploader_thumbnail;
+    
+    // 5. Try album/playlist artwork if available
+    if (!thumbnailUrl && info.album) {
+      if (info.album.thumbnail) {
+        thumbnailUrl = extractThumbnailUrl(info.album.thumbnail);
+      } else if (info.album.thumbnails && Array.isArray(info.album.thumbnails) && info.album.thumbnails.length > 0) {
+        thumbnailUrl = extractThumbnailUrl(info.album.thumbnails[info.album.thumbnails.length - 1]);
+      } else if (info.album.artwork_url) {
+        thumbnailUrl = info.album.artwork_url;
+      }
     }
+    
+    // 6. Try playlist artwork if track is in a playlist
+    if (!thumbnailUrl && info.playlist) {
+      if (info.playlist.thumbnail) {
+        thumbnailUrl = extractThumbnailUrl(info.playlist.thumbnail);
+      } else if (info.playlist.artwork_url) {
+        thumbnailUrl = info.playlist.artwork_url;
+      } else if (info.playlist.thumbnails && Array.isArray(info.playlist.thumbnails) && info.playlist.thumbnails.length > 0) {
+        thumbnailUrl = extractThumbnailUrl(info.playlist.thumbnails[info.playlist.thumbnails.length - 1]);
+      }
+    }
+    
+    // 7. Try uploader/artist artwork as last resort
+    if (!thumbnailUrl && info.uploader_thumbnail) {
+      thumbnailUrl = extractThumbnailUrl(info.uploader_thumbnail);
+    }
+    
+    // 8. Try to construct SoundCloud artwork URL from track ID if available
+    if (!thumbnailUrl && info.id) {
+      // SoundCloud artwork URL pattern: https://i1.sndcdn.com/artworks-{id}-large.jpg
+      // Try to extract ID from various sources
+      let artworkId = null;
+      if (info.artwork_url) {
+        const match = info.artwork_url.match(/artworks-([^-]+)/);
+        if (match) artworkId = match[1];
+      }
+      if (!artworkId && info.thumbnails) {
+        // Try to find ID in thumbnails
+        const thumbStr = JSON.stringify(info.thumbnails);
+        const match = thumbStr.match(/artworks-([^-]+)/);
+        if (match) artworkId = match[1];
+      }
+      if (artworkId) {
+        thumbnailUrl = `https://i1.sndcdn.com/artworks-${artworkId}-large.jpg`;
+      }
+    }
+    
+    // Log all available fields for debugging
+    console.log('Artwork search - Available fields:', {
+      thumbnail: info.thumbnail,
+      thumbnails: info.thumbnails,
+      artwork_url: info.artwork_url,
+      album: info.album,
+      playlist: info.playlist,
+      uploader_thumbnail: info.uploader_thumbnail,
+      track: info.track ? { artwork_url: info.track.artwork_url } : null
+    });
     
     if (thumbnailUrl) {
       try {
+        // Replace size modifiers in SoundCloud URLs to get larger images
+        thumbnailUrl = thumbnailUrl.replace(/-t\d+x\d+\.jpg/, '-large.jpg');
+        thumbnailUrl = thumbnailUrl.replace(/-small\.jpg/, '-large.jpg');
+        thumbnailUrl = thumbnailUrl.replace(/-medium\.jpg/, '-large.jpg');
+        thumbnailUrl = thumbnailUrl.replace(/-t\d+x\d+\.png/, '-large.png');
+        
         const artworkDir = path.join(app.getPath('userData'), 'artwork');
         if (!fs.existsSync(artworkDir)) {
           fs.mkdirSync(artworkDir, { recursive: true });
         }
         artworkPath = path.join(artworkDir, `${info.id}.jpg`);
         console.log('Downloading artwork from:', thumbnailUrl);
-        console.log('Available artwork sources:', {
-          thumbnail: info.thumbnail,
-          thumbnails: info.thumbnails,
-          album: info.album,
-          playlist: info.playlist,
-          uploader_thumbnail: info.uploader_thumbnail
-        });
         await downloadArtwork(thumbnailUrl, artworkPath);
         console.log('Artwork downloaded successfully');
         
-        // Embed artwork to audio file
-        await embedArtworkToFile(absolutePath, artworkPath);
-        console.log('Artwork embedded successfully');
+        // Artwork will be embedded together with metadata in writeMetadataToFile
+        // No need to embed separately to avoid overwriting
+        console.log('Artwork ready for embedding');
       } catch (artworkError) {
         console.log('Error downloading/embedding artwork:', artworkError.message);
-        // Continue even if artwork fails
+        console.log('Artwork error stack:', artworkError.stack);
+        
+        // Fallback: Try to download thumbnail using yt-dlp
+        try {
+          console.log('Trying to download thumbnail using yt-dlp as fallback...');
+          const thumbnailDir = path.join(app.getPath('userData'), 'artwork');
+          if (!fs.existsSync(thumbnailDir)) {
+            fs.mkdirSync(thumbnailDir, { recursive: true });
+          }
+          // Use absolute path and ensure it's writable
+          const thumbnailOutputPath = path.resolve(thumbnailDir, `${info.id}.%(ext)s`);
+          
+          const thumbnailArgs = [
+            '--write-thumbnail',
+            '--skip-download',
+            '--convert-thumbnails', 'jpg',
+            '--no-warnings',
+            '-o', thumbnailOutputPath,
+            cleanUrl
+          ];
+          
+          // Change working directory to thumbnailDir to avoid write issues
+          const originalCwd = process.cwd();
+          try {
+            process.chdir(thumbnailDir);
+            await execFileAsync(ytDlpPath, thumbnailArgs);
+          } finally {
+            process.chdir(originalCwd);
+          }
+          
+          // Find the downloaded thumbnail file
+          const files = fs.readdirSync(thumbnailDir);
+          const thumbnailFile = files.find(f => f.startsWith(`${info.id}.`));
+          if (thumbnailFile) {
+            artworkPath = path.join(thumbnailDir, thumbnailFile);
+            console.log('Thumbnail downloaded using yt-dlp:', artworkPath);
+            
+            // Artwork will be embedded together with metadata in writeMetadataToFile
+            console.log('Artwork ready for embedding using yt-dlp thumbnail');
+          }
+        } catch (ytDlpThumbnailError) {
+          console.log('Error downloading thumbnail with yt-dlp:', ytDlpThumbnailError.message);
+          // Continue even if all artwork methods fail
+        }
       }
     } else {
-      console.log('No artwork thumbnail found in track info');
-      console.log('Available info fields:', Object.keys(info));
+      console.log('No artwork thumbnail found in track info, trying yt-dlp thumbnail download...');
+      
+      // Last resort: Try to download thumbnail using yt-dlp directly
+      try {
+        const thumbnailDir = path.join(app.getPath('userData'), 'artwork');
+        if (!fs.existsSync(thumbnailDir)) {
+          fs.mkdirSync(thumbnailDir, { recursive: true });
+        }
+        // Use absolute path and ensure it's writable
+        const thumbnailOutputPath = path.resolve(thumbnailDir, `${info.id}.%(ext)s`);
+        
+        const thumbnailArgs = [
+          '--write-thumbnail',
+          '--skip-download',
+          '--convert-thumbnails', 'jpg',
+          '--no-warnings',
+          '-o', thumbnailOutputPath,
+          cleanUrl
+        ];
+        
+        // Change working directory to thumbnailDir to avoid write issues
+        const originalCwd = process.cwd();
+        try {
+          process.chdir(thumbnailDir);
+          await execFileAsync(ytDlpPath, thumbnailArgs);
+        } finally {
+          process.chdir(originalCwd);
+        }
+        
+        // Find the downloaded thumbnail file
+        const files = fs.readdirSync(thumbnailDir);
+        const thumbnailFile = files.find(f => f.startsWith(`${info.id}.`));
+        if (thumbnailFile) {
+          artworkPath = path.join(thumbnailDir, thumbnailFile);
+          console.log('Thumbnail downloaded using yt-dlp:', artworkPath);
+          
+          // Artwork will be embedded together with metadata in writeMetadataToFile
+          console.log('Artwork ready for embedding using yt-dlp thumbnail');
+        }
+      } catch (ytDlpThumbnailError) {
+        console.log('Error downloading thumbnail with yt-dlp:', ytDlpThumbnailError.message);
+        console.log('Available info fields:', Object.keys(info));
+        // Continue even if all artwork methods fail
+      }
     }
     
     // Write BPM dan Key ke metadata file audio agar terbaca di Rekordbox
     try {
+      // Log file info before writing
+      if (fs.existsSync(absolutePath)) {
+        const beforeStats = fs.statSync(absolutePath);
+        console.log('File before metadata write - size:', beforeStats.size, 'bytes, path:', absolutePath);
+        console.log('File extension:', path.extname(absolutePath).toLowerCase());
+      } else {
+        console.log('WARNING: File does not exist before metadata write:', absolutePath);
+      }
+      
+      console.log('Writing metadata with artwork path:', artworkPath);
+      console.log('Artwork path exists:', artworkPath ? fs.existsSync(artworkPath) : 'N/A');
+      
+      // For M4A files, check if file already has artwork and log it
+      const fileExt = path.extname(absolutePath).toLowerCase();
+      if (fileExt === '.m4a' && fs.existsSync(absolutePath)) {
+        try {
+          let ffprobePath = getFfmpegPath().replace('ffmpeg', 'ffprobe');
+          if (!fs.existsSync(ffprobePath)) {
+            const commonProbePaths = ['ffprobe', '/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe', '/usr/bin/ffprobe'];
+            for (const probePath of commonProbePaths) {
+              if (fs.existsSync(probePath)) {
+                ffprobePath = probePath;
+                break;
+              }
+            }
+          }
+          if (fs.existsSync(ffprobePath)) {
+            const probeArgs = ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', absolutePath];
+            const { stdout: probeStdout } = await execFileAsync(ffprobePath, probeArgs);
+            if (probeStdout && probeStdout.toString().trim()) {
+              console.log('WARNING: M4A file already has artwork stream before embedding:', probeStdout.toString().trim());
+              console.log('This may prevent new artwork from being added. File will be processed anyway.');
+            } else {
+              console.log('M4A file does not have artwork stream - good, will add new artwork');
+            }
+          }
+        } catch (probeError) {
+          // Ignore probe errors
+        }
+      }
+      
       await writeMetadataToFile(absolutePath, {
         bpm: bpm,
         key: key,
@@ -928,9 +1434,19 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
         artist: info.uploader || info.channel || 'Unknown Artist',
         artworkPath: artworkPath
       });
+      
+      // Verify file after writing
+      if (fs.existsSync(absolutePath)) {
+        const afterStats = fs.statSync(absolutePath);
+        console.log('File after metadata write - size:', afterStats.size, 'bytes');
+      } else {
+        console.log('ERROR: File does not exist after metadata write:', absolutePath);
+      }
+      
       console.log('Metadata written to file successfully');
     } catch (writeError) {
       console.log('Error writing metadata to file:', writeError.message);
+      console.log('Error stack:', writeError.stack);
       // Continue even if metadata write fails
     }
     
@@ -943,14 +1459,18 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
       url: `file://${absolutePath}`,
       filePath: absolutePath,
       bpm: bpm || null,
-      key: key || null
+      key: key || null,
+      artworkPath: artworkPath || null // Store artwork path for later use
     };
     
     console.log('Returning track data:', trackData);
     return trackData;
   } catch (error) {
     console.error('Error adding SoundCloud track:', error);
-    throw error;
+    console.error('Error stack:', error.stack);
+    // Provide user-friendly error message
+    const errorMessage = error.message || 'Unknown error occurred';
+    throw new Error(`Failed to add SoundCloud track: ${errorMessage}`);
   }
 });
 
@@ -966,6 +1486,13 @@ function getNextILoveMusicZipPath(downloadsPath) {
   return zipPath;
 }
 
+// Helper function to send progress update
+function sendDownloadProgress(progress) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('download:progress', progress);
+  }
+}
+
 // Handler untuk download track ke folder Downloads
 ipcMain.handle('soundcloud:download', async (_, trackIds, tracks) => {
   try {
@@ -979,10 +1506,96 @@ ipcMain.handle('soundcloud:download', async (_, trackIds, tracks) => {
         throw new Error('Track file not found');
       }
 
-      const fileName = `${track.title} - ${track.artist}.mp3`.replace(/[<>:"/\\|?*]/g, '_');
+      const fileExt = path.extname(track.filePath).toLowerCase() || '.mp3';
+      const fileName = `${track.title} - ${track.artist}${fileExt}`.replace(/[<>:"/\\|?*]/g, '_');
       const destPath = path.join(downloadsPath, fileName);
       
-      fs.copyFileSync(track.filePath, destPath);
+      // Get file size for progress calculation
+      const stats = fs.statSync(track.filePath);
+      const fileSize = stats.size;
+      let copiedBytes = 0;
+      
+      // Copy file with progress tracking
+      sendDownloadProgress(0);
+      const readStream = fs.createReadStream(track.filePath);
+      const writeStream = fs.createWriteStream(destPath);
+      
+      // Track progress updates
+      let lastProgress = 0;
+      readStream.on('data', (chunk) => {
+        copiedBytes += chunk.length;
+        const progress = Math.min(90, Math.round((copiedBytes / fileSize) * 90)); // Reserve 10% for metadata embedding
+        // Only send progress if it changed (to avoid too many updates)
+        if (progress !== lastProgress) {
+          sendDownloadProgress(progress);
+          lastProgress = progress;
+        }
+      });
+      
+      readStream.pipe(writeStream);
+      
+      await new Promise((resolve, reject) => {
+        writeStream.on('finish', async () => {
+          try {
+            // Ensure artwork is embedded in the downloaded file
+            let artworkPathToUse = track.artworkPath;
+            
+            // If artworkPath is not in track data, try to find it from artwork directory
+            if (!artworkPathToUse || !fs.existsSync(artworkPathToUse)) {
+              const artworkDir = path.join(app.getPath('userData'), 'artwork');
+              if (fs.existsSync(artworkDir)) {
+                const files = fs.readdirSync(artworkDir);
+                const artworkFile = files.find(f => f.startsWith(`${track.id}.`));
+                if (artworkFile) {
+                  artworkPathToUse = path.join(artworkDir, artworkFile);
+                }
+              }
+            }
+            
+            // Embed artwork and metadata if artwork exists
+            if (artworkPathToUse && fs.existsSync(artworkPathToUse)) {
+              console.log('Embedding artwork to downloaded file:', destPath);
+              console.log('Using artwork path:', artworkPathToUse);
+              
+              await writeMetadataToFile(destPath, {
+                title: track.title || 'Unknown',
+                artist: track.artist || 'Unknown Artist',
+                bpm: track.bpm || null,
+                key: track.key || null,
+                artworkPath: artworkPathToUse
+              });
+              
+              console.log('Artwork embedded successfully to downloaded file');
+            } else {
+              // Even without artwork, ensure metadata is written
+              console.log('No artwork found, writing metadata only');
+              await writeMetadataToFile(destPath, {
+                title: track.title || 'Unknown',
+                artist: track.artist || 'Unknown Artist',
+                bpm: track.bpm || null,
+                key: track.key || null,
+                artworkPath: null
+              });
+            }
+            
+            // Ensure 100% is sent
+            sendDownloadProgress(100);
+            // Small delay to ensure progress is sent and UI updates
+            setTimeout(() => {
+              resolve();
+            }, 300);
+          } catch (embedError) {
+            console.error('Error embedding artwork during download:', embedError);
+            // Still resolve - file was copied successfully
+            sendDownloadProgress(100);
+            setTimeout(() => {
+              resolve();
+            }, 300);
+          }
+        });
+        writeStream.on('error', reject);
+        readStream.on('error', reject);
+      });
       
       return { success: true, path: destPath };
     } else {
@@ -992,18 +1605,115 @@ ipcMain.handle('soundcloud:download', async (_, trackIds, tracks) => {
       const output = fs.createWriteStream(zipPath);
       const archive = archiver('zip', { zlib: { level: 9 } });
 
-      return new Promise((resolve, reject) => {
-        archive.on('error', reject);
-        output.on('close', () => resolve({ success: true, path: zipPath }));
-
-        archive.pipe(output);
-
-        trackIds.forEach(trackId => {
+      // First, copy all files to a temp directory with artwork embedded
+      const tempDir = path.join(app.getPath('temp'), `ilovemusic-download-${Date.now()}`);
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+      
+      // Process all tracks with artwork embedding
+      const processTracks = async () => {
+        const processedFiles = [];
+        
+        for (const trackId of trackIds) {
           const track = tracks.find(t => t.id === trackId);
           if (track && track.filePath && fs.existsSync(track.filePath)) {
-            const fileName = `${track.title} - ${track.artist}.mp3`.replace(/[<>:"/\\|?*]/g, '_');
-            archive.file(track.filePath, { name: fileName });
+            const fileExt = path.extname(track.filePath).toLowerCase() || '.mp3';
+            const fileName = `${track.title} - ${track.artist}${fileExt}`.replace(/[<>:"/\\|?*]/g, '_');
+            const tempFilePath = path.join(tempDir, fileName);
+            
+            // Copy file first
+            fs.copyFileSync(track.filePath, tempFilePath);
+            
+            // Find artwork path
+            let artworkPathToUse = track.artworkPath;
+            if (!artworkPathToUse || !fs.existsSync(artworkPathToUse)) {
+              const artworkDir = path.join(app.getPath('userData'), 'artwork');
+              if (fs.existsSync(artworkDir)) {
+                const files = fs.readdirSync(artworkDir);
+                const artworkFile = files.find(f => f.startsWith(`${track.id}.`));
+                if (artworkFile) {
+                  artworkPathToUse = path.join(artworkDir, artworkFile);
+                }
+              }
+            }
+            
+            // Embed artwork and metadata
+            try {
+              if (artworkPathToUse && fs.existsSync(artworkPathToUse)) {
+                console.log('Embedding artwork to file for ZIP:', tempFilePath);
+                await writeMetadataToFile(tempFilePath, {
+                  title: track.title || 'Unknown',
+                  artist: track.artist || 'Unknown Artist',
+                  bpm: track.bpm || null,
+                  key: track.key || null,
+                  artworkPath: artworkPathToUse
+                });
+              } else {
+                // Even without artwork, ensure metadata is written
+                await writeMetadataToFile(tempFilePath, {
+                  title: track.title || 'Unknown',
+                  artist: track.artist || 'Unknown Artist',
+                  bpm: track.bpm || null,
+                  key: track.key || null,
+                  artworkPath: null
+                });
+              }
+            } catch (embedError) {
+              console.error('Error embedding artwork for track:', track.title, embedError);
+              // Continue anyway - file was copied
+            }
+            
+            processedFiles.push({ path: tempFilePath, name: fileName });
           }
+        }
+        
+        return processedFiles;
+      };
+      
+      // Process tracks first, then create ZIP
+      const processedFiles = await processTracks();
+
+      return new Promise((resolve, reject) => {
+        archive.on('error', reject);
+        
+        // Track progress for ZIP creation
+        archive.on('progress', (progress) => {
+          // progress.entries.processed = files processed
+          // progress.entries.total = total files
+          // progress.bytes.processed = bytes processed
+          // progress.bytes.total = total bytes (if available)
+          let percent = 0;
+          if (progress.entries.total > 0) {
+            percent = Math.round((progress.entries.processed / progress.entries.total) * 100);
+          } else if (progress.bytes.total > 0) {
+            percent = Math.round((progress.bytes.processed / progress.bytes.total) * 100);
+          }
+          sendDownloadProgress(Math.min(100, percent));
+        });
+        
+        output.on('close', () => {
+          // Clean up temp directory
+          try {
+            if (fs.existsSync(tempDir)) {
+              fs.rmSync(tempDir, { recursive: true, force: true });
+            }
+          } catch (cleanupError) {
+            console.error('Error cleaning up temp directory:', cleanupError);
+          }
+          
+          sendDownloadProgress(100);
+          // Small delay to ensure progress is sent and UI updates
+          setTimeout(() => {
+            resolve({ success: true, path: zipPath });
+          }, 200);
+        });
+
+        archive.pipe(output);
+        
+        // Add processed files to archive
+        processedFiles.forEach(file => {
+          archive.file(file.path, { name: file.name });
         });
 
         archive.finalize();
@@ -1011,6 +1721,7 @@ ipcMain.handle('soundcloud:download', async (_, trackIds, tracks) => {
     }
   } catch (error) {
     console.error('Error downloading tracks:', error);
+    sendDownloadProgress(0); // Reset progress on error
     throw error;
   }
 });
@@ -1084,3 +1795,50 @@ function escapeXml(unsafe) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
 }
+
+// Handler untuk menyimpan tracks ke file
+ipcMain.handle('tracks:save', async (_, tracks) => {
+  try {
+    const userDataPath = app.getPath('userData');
+    const tracksFilePath = path.join(userDataPath, 'tracks.json');
+    
+    // Ensure userData directory exists
+    if (!fs.existsSync(userDataPath)) {
+      fs.mkdirSync(userDataPath, { recursive: true });
+    }
+    
+    // Save tracks to file
+    fs.writeFileSync(tracksFilePath, JSON.stringify(tracks, null, 2), 'utf8');
+    console.log('Tracks saved to:', tracksFilePath);
+    
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving tracks:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Handler untuk memuat tracks dari file
+ipcMain.handle('tracks:load', async () => {
+  try {
+    const userDataPath = app.getPath('userData');
+    const tracksFilePath = path.join(userDataPath, 'tracks.json');
+    
+    // Check if file exists
+    if (!fs.existsSync(tracksFilePath)) {
+      console.log('Tracks file not found, returning empty array');
+      return { success: true, tracks: [] };
+    }
+    
+    // Read and parse tracks from file
+    const fileContent = fs.readFileSync(tracksFilePath, 'utf8');
+    const tracks = JSON.parse(fileContent);
+    console.log('Tracks loaded from:', tracksFilePath, 'Count:', tracks.length);
+    
+    return { success: true, tracks: tracks };
+  } catch (error) {
+    console.error('Error loading tracks:', error);
+    // Return empty array on error instead of failing
+    return { success: true, tracks: [] };
+  }
+});

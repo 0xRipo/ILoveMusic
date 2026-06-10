@@ -320,7 +320,7 @@ Made with ❤️ by RIPO
 ## Links
 
 - **Repository:** https://github.com/0xMochamad-Arif-Fahrizal/ILoveMusic
-- **Instagram:** [@cactusdomain](https://www.instagram.com/cactusdomain/)
+- **Instagram:** [@ripo__________](https://www.instagram.com/ripo__________/)
 - **Issues:** https://github.com/0xMochamad-Arif-Fahrizal/ILoveMusic/issues
 
 ---

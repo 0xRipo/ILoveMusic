@@ -10,8 +10,10 @@ const ILoveMusic = () => {
   const [playingTrack, setPlayingTrack] = useState(null);
   const [loadingTrack, setLoadingTrack] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
   
   const [tracks, setTracks] = useState([]);
+  const [tracksLoaded, setTracksLoaded] = useState(false);
   
   // Search & Filter states
   const [searchQuery, setSearchQuery] = useState('');
@@ -27,28 +29,67 @@ const ILoveMusic = () => {
   const [editingTrack, setEditingTrack] = useState(null);
   
   const audioRefs = useRef({});
+  const downloadProgressRef = useRef(0);
 
-  // Load tracks from localStorage on mount
+  // Load tracks from file on mount
   useEffect(() => {
-    const savedTracks = localStorage.getItem('ilovemusic_tracks');
-    if (savedTracks) {
+    const loadTracks = async () => {
       try {
-        const parsedTracks = JSON.parse(savedTracks);
-        setTracks(parsedTracks);
+        if (window.electron && window.electron.loadTracks) {
+          const result = await window.electron.loadTracks();
+          if (result.success && result.tracks) {
+            setTracks(result.tracks);
+            setTracksLoaded(true);
+            console.log('Tracks loaded from file:', result.tracks.length);
+          } else {
+            setTracksLoaded(true);
+          }
+        } else {
+          // Fallback to localStorage for development
+          const savedTracks = localStorage.getItem('ilovemusic_tracks');
+          if (savedTracks) {
+            try {
+              const parsedTracks = JSON.parse(savedTracks);
+              setTracks(parsedTracks);
+            } catch (err) {
+              console.error('Error loading tracks from localStorage:', err);
+            }
+          }
+          setTracksLoaded(true);
+        }
       } catch (err) {
-        console.error('Error loading tracks from localStorage:', err);
+        console.error('Error loading tracks:', err);
+        setTracksLoaded(true);
       }
-    }
+    };
+    
+    loadTracks();
   }, []);
 
-  // Save tracks to localStorage whenever tracks change
+  // Save tracks to file whenever tracks change (but only after initial load)
   useEffect(() => {
-    if (tracks.length > 0) {
-      localStorage.setItem('ilovemusic_tracks', JSON.stringify(tracks));
-    } else {
-      localStorage.removeItem('ilovemusic_tracks');
-    }
-  }, [tracks]);
+    if (!tracksLoaded) return; // Don't save until tracks have been loaded
+    
+    const saveTracks = async () => {
+      try {
+        if (window.electron && window.electron.saveTracks) {
+          await window.electron.saveTracks(tracks);
+          console.log('Tracks saved to file:', tracks.length);
+        } else {
+          // Fallback to localStorage for development
+          if (tracks.length > 0) {
+            localStorage.setItem('ilovemusic_tracks', JSON.stringify(tracks));
+          } else {
+            localStorage.removeItem('ilovemusic_tracks');
+          }
+        }
+      } catch (err) {
+        console.error('Error saving tracks:', err);
+      }
+    };
+    
+    saveTracks();
+  }, [tracks, tracksLoaded]);
 
   const handleAddSoundCloud = async () => {
     if (!pastedUrl.trim() || loadingTrack) return;
@@ -250,13 +291,54 @@ const ILoveMusic = () => {
     document.addEventListener('mouseup', handleMouseUp);
   };
 
+  // Setup download progress listener
+  useEffect(() => {
+    if (window.electron && window.electron.onDownloadProgress) {
+      window.electron.onDownloadProgress((progress) => {
+        downloadProgressRef.current = progress;
+        setDownloadProgress(progress);
+      });
+    }
+    
+    return () => {
+      if (window.electron && window.electron.removeDownloadProgressListener) {
+        window.electron.removeDownloadProgressListener();
+      }
+    };
+  }, []);
+
   const handleDownload = async () => {
     if (selected.size === 0 || downloading) return;
     
     setDownloading(true);
+    setDownloadProgress(0);
+    downloadProgressRef.current = 0;
     try {
       const trackIds = Array.from(selected);
-      const result = await window.electron.downloadTracks(trackIds, tracks);
+      
+      // Wait for progress to reach 100% before showing success
+      const waitForProgress = () => {
+        return new Promise((resolve) => {
+          const checkProgress = () => {
+            if (downloadProgressRef.current >= 100) {
+              // Wait a bit more for animation to complete
+              setTimeout(() => resolve(), 300);
+            } else {
+              setTimeout(checkProgress, 50);
+            }
+          };
+          checkProgress();
+        });
+      };
+      
+      // Start download
+      const downloadPromise = window.electron.downloadTracks(trackIds, tracks);
+      
+      // Wait for download to complete
+      const result = await downloadPromise;
+      
+      // Wait for progress to reach 100%
+      await waitForProgress();
       
       if (result.success) {
         alert(`Download successful! File saved to Downloads folder.`);
@@ -267,6 +349,11 @@ const ILoveMusic = () => {
       console.error(err);
     } finally {
       setDownloading(false);
+      // Keep progress at 100% for a moment before resetting
+      setTimeout(() => {
+        setDownloadProgress(0);
+        downloadProgressRef.current = 0;
+      }, 500);
     }
   };
 
@@ -1128,12 +1215,28 @@ const ILoveMusic = () => {
               }}
             >
               {downloading 
-                ? 'DOWNLOADING...' 
+                ? `DOWNLOADING... ${downloadProgress}%` 
                 : selected.size === 1 
                   ? 'DOWNLOAD TRACK' 
                   : `DOWNLOAD ${selected.size} AS ZIP`}
             </button>
           </div>
+          {downloading && (
+            <div style={{
+              width: '100%',
+              height: '4px',
+              backgroundColor: '#333',
+              borderRadius: 0,
+              overflow: 'hidden'
+            }}>
+              <div style={{
+                width: `${downloadProgress}%`,
+                height: '100%',
+                backgroundColor: '#fff',
+                transition: 'width 0.3s ease-out'
+              }}></div>
+            </div>
+          )}
         </div>
       )}
 

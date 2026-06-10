@@ -1,6 +1,8 @@
 {
     "name": "ilovemusic-desktop",
-    "version": "0.1.0",
+    "version": "0.1.2",
+    "description": "ILoveMusic - SoundCloud Music Downloader and Player",
+    "author": "CactusDomain",
     "main": "main.js",
     "private": true,
     "scripts": {
