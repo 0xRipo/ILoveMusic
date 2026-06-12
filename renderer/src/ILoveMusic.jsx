@@ -528,7 +528,7 @@ const ILoveMusic = () => {
           type="text"
           value={pastedUrl}
           onChange={(e) => setPastedUrl(e.target.value)}
-          placeholder="PASTE SOUNDCLOUD URL"
+          placeholder="PASTE SOUNDCLOUD OR SPOTIFY URL"  // CHANGED: Support both SoundCloud and Spotify
           onKeyPress={(e) => {
             if (e.key === 'Enter') {
               handleAddSoundCloud();

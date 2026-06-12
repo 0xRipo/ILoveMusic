@@ -5,6 +5,18 @@ const fs = require('fs');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
+// Load environment variables from .env file
+require('dotenv').config();
+const https = require('https');
+
+// Spotify API credentials
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+
+// Store Spotify access token
+let spotifyAccessToken = null;
+let spotifyTokenExpiry = 0;
+
 // Store main window reference for progress updates
 let mainWindow = null;
 
@@ -627,6 +639,480 @@ async function writeMetadataToFile(filePath, metadata) {
   }
 }
 
+// ============================================================================
+// SPOTIFY INTEGRATION FUNCTIONS
+// ============================================================================
+
+/**
+ * Detect URL source (soundcloud, spotify, or unknown)
+ */
+function detectUrlSource(url) {
+  if (!url || typeof url !== 'string') return 'unknown';
+  
+  const lowerUrl = url.toLowerCase();
+  if (lowerUrl.includes('soundcloud.com')) return 'soundcloud';
+  if (lowerUrl.includes('open.spotify.com/track/')) return 'spotify';
+  
+  return 'unknown';
+}
+
+/**
+ * Extract Spotify track ID from URL
+ * Example: https://open.spotify.com/track/47iKV0KlcvlflSsrCPD3TQ?si=xxx
+ * Returns: 47iKV0KlcvlflSsrCPD3TQ
+ */
+function extractSpotifyTrackId(url) {
+  const match = url.match(/track\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Get Spotify access token using Client Credentials Flow
+ */
+async function getSpotifyAccessToken() {
+  // Check if token is still valid
+  if (spotifyAccessToken && Date.now() < spotifyTokenExpiry) {
+    return spotifyAccessToken;
+  }
+  
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+    throw new Error('Spotify credentials not configured. Please add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to .env file');
+  }
+  
+  return new Promise((resolve, reject) => {
+    const auth = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+    const postData = 'grant_type=client_credentials';
+    
+    const options = {
+      hostname: 'accounts.spotify.com',
+      path: '/api/token',
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let data = '';
+      
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      res.on('end', () => {
+        try {
+          if (res.statusCode === 200) {
+            const json = JSON.parse(data);
+            spotifyAccessToken = json.access_token;
+            // Token expires in 1 hour, set expiry to 50 minutes to be safe
+            spotifyTokenExpiry = Date.now() + (50 * 60 * 1000);
+            resolve(spotifyAccessToken);
+          } else {
+            reject(new Error(`Spotify auth failed: ${res.statusCode} ${data}`));
+          }
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    
+    req.on('error', (err) => {
+      reject(new Error(`Spotify auth request failed: ${err.message}`));
+    });
+    
+    req.write(postData);
+    req.end();
+  });
+}
+
+/**
+ * Fetch track metadata from Spotify API
+ */
+async function fetchSpotifyTrackMetadata(trackId) {
+  const token = await getSpotifyAccessToken();
+  
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.spotify.com',
+      path: `/v1/tracks/${trackId}`,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let data = '';
+      
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      res.on('end', () => {
+        try {
+          if (res.statusCode === 200) {
+            const json = JSON.parse(data);
+            
+            // Extract metadata
+            const metadata = {
+              id: json.id,
+              title: json.name,
+              artist: json.artists && json.artists.length > 0 ? json.artists[0].name : 'Unknown Artist',
+              // Join all artists if multiple
+              allArtists: json.artists ? json.artists.map(a => a.name).join(', ') : 'Unknown Artist',
+              duration: Math.round(json.duration_ms / 1000), // Convert to seconds
+              thumbnail: null,
+              albumName: json.album ? json.album.name : null
+            };
+            
+            // Get largest album cover image
+            if (json.album && json.album.images && json.album.images.length > 0) {
+              // Images are sorted by size, largest first
+              metadata.thumbnail = json.album.images[0].url;
+            }
+            
+            resolve(metadata);
+          } else if (res.statusCode === 404) {
+            reject(new Error('Spotify track not found'));
+          } else {
+            reject(new Error(`Spotify API error: ${res.statusCode} ${data}`));
+          }
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    
+    req.on('error', (err) => {
+      reject(new Error(`Spotify API request failed: ${err.message}`));
+    });
+    
+    req.end();
+  });
+}
+
+/**
+ * Download audio from Spotify using spotdl (better quality & matching)
+ */
+async function downloadAudioFromSpotify(spotifyUrl, outputDir, trackId, metadata) {
+  const spotdlPath = getSpotdlPath();
+  
+  console.log('Downloading from Spotify using spotdl:', spotifyUrl);
+  console.log('Expected track:', metadata.title, 'by', metadata.artist);
+  
+  const downloadArgs = [
+    spotifyUrl,
+    '--output', path.join(outputDir, `${trackId}`),
+    '--format', 'mp3',
+    '--bitrate', '320k',  // Maximum quality
+    '--threads', '4',
+    '--print-errors',  // Show detailed errors
+    '--sponsor-block',  // Skip sponsor segments
+    '--restrict',  // Restrict filenames (safer)
+    // More strict matching
+    '--m3u', 'false',
+    '--generate-lrc', 'false'
+  ];
+  
+  // Add audio provider preference for better matching
+  const providers = ['youtube-music', 'youtube'];  // Prefer YouTube Music for better match
+  for (const provider of providers) {
+    downloadArgs.push('--audio-provider', provider);
+  }
+  
+  try {
+    const { stdout, stderr } = await execFileAsync(spotdlPath, downloadArgs, { 
+      timeout: 180000,  // 3 minutes timeout
+      maxBuffer: 1024 * 1024 * 10  // 10MB buffer for output
+    });
+    
+    // Log output for debugging
+    if (stdout) console.log('spotdl output:', stdout.toString().substring(0, 500));
+    if (stderr) console.log('spotdl stderr:', stderr.toString().substring(0, 500));
+    
+    console.log('✅ Audio downloaded successfully from Spotify using spotdl');
+    console.log('   Quality: 320kbps MP3');
+  } catch (downloadError) {
+    console.log('❌ spotdl download error:', downloadError.message);
+    throw new Error(`Failed to download from Spotify: ${downloadError.message}`);
+  }
+}
+
+/**
+ * Download audio from YouTube using yt-dlp with search query (fallback)
+ * Now with improved search query for better matching
+ */
+async function downloadAudioFromYouTubeSearch(searchQuery, outputPath, trackId, metadata = null) {
+  const ytDlpPath = getYtDlpPath();
+  
+  // Improve search query if metadata available
+  let improvedQuery = searchQuery;
+  if (metadata) {
+    // Add "official audio" or "official video" for better matching
+    improvedQuery = `${metadata.artist} ${metadata.title} official audio`;
+    console.log('Improved search query:', improvedQuery);
+  }
+  
+  // Use ytsearch1: prefix to search YouTube and download first result
+  const searchUrl = `ytsearch1:${improvedQuery}`;
+  
+  console.log('Searching YouTube for:', improvedQuery);
+  
+  const downloadArgs = [
+    '-x',
+    '--audio-format', 'mp3',
+    '--audio-quality', '0',
+    '--prefer-ffmpeg',
+    '-o', outputPath,
+    searchUrl
+  ];
+  
+  try {
+    await execFileAsync(ytDlpPath, downloadArgs, { timeout: 120000 }); // 2 minutes timeout
+    console.log('Audio downloaded successfully from YouTube');
+  } catch (downloadError) {
+    // If error with conversion, try without
+    if (downloadError.message && (downloadError.message.includes('ffmpeg') || downloadError.message.includes('ffprobe'))) {
+      console.log('ffmpeg not found, trying to download original format...');
+      const originalArgs = [
+        '-x',
+        '-f', 'bestaudio',
+        '-o', outputPath,
+        searchUrl
+      ];
+      await execFileAsync(ytDlpPath, originalArgs, { timeout: 120000 });
+    } else {
+      throw downloadError;
+    }
+  }
+}
+
+/**
+ * Process Spotify track - main handler
+ */
+async function processSpotifyTrack(url) {
+  console.log('Processing Spotify URL:', url);
+  
+  // Extract track ID
+  const trackId = extractSpotifyTrackId(url);
+  if (!trackId) {
+    throw new Error('Invalid Spotify URL. Could not extract track ID.');
+  }
+  
+  console.log('Spotify track ID:', trackId);
+  
+  // Fetch metadata from Spotify API
+  console.log('Fetching metadata from Spotify API...');
+  const spotifyMetadata = await fetchSpotifyTrackMetadata(trackId);
+  console.log('Spotify metadata:', spotifyMetadata);
+  
+  // Prepare output directory
+  const outputDir = path.join(app.getPath('userData'), 'tracks');
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+  
+  // Generate unique ID for this track
+  const uniqueId = Date.now();
+  
+  // Delete any existing files with same ID
+  const possibleExtensions = ['mp3', 'm4a', 'mp4', 'aac', 'ogg', 'flac', 'opus', 'webm'];
+  for (const ext of possibleExtensions) {
+    const existingFile = path.join(outputDir, `${uniqueId}.${ext}`);
+    if (fs.existsSync(existingFile)) {
+      console.log(`Deleting existing file: ${existingFile}`);
+      fs.unlinkSync(existingFile);
+    }
+  }
+  
+  // Download audio using spotdl (better quality for Spotify)
+  console.log('Downloading audio from Spotify using spotdl...');
+  
+  let downloadSource = 'spotdl';  // Track which method was used
+  
+  try {
+    await downloadAudioFromSpotify(url, outputDir, uniqueId, spotifyMetadata);
+    console.log('✅ Successfully downloaded using spotdl (320kbps)');
+    downloadSource = 'spotdl';
+  } catch (spotdlError) {
+    console.log('⚠️ spotdl failed, falling back to YouTube search:', spotdlError.message);
+    downloadSource = 'youtube-fallback';
+    // Fallback to YouTube search if spotdl fails - now with improved query
+    const outputTemplate = path.join(outputDir, `${uniqueId}.%(ext)s`);
+    await downloadAudioFromYouTubeSearch(
+      `${spotifyMetadata.title} ${spotifyMetadata.artist}`,
+      outputTemplate,
+      uniqueId,
+      spotifyMetadata  // Pass metadata for improved search
+    );
+  }
+  
+  // Wait for file to be written
+  await new Promise(resolve => setTimeout(resolve, 500));
+  
+  // Find downloaded file
+  const filesInDir = fs.readdirSync(outputDir);
+  const audioExtensions = ['.mp3', '.m4a', '.opus', '.ogg', '.webm', '.flac', '.wav', '.aac'];
+  
+  let downloadedFile = filesInDir.find(f => 
+    f.startsWith(uniqueId.toString()) && 
+    audioExtensions.some(ext => f.toLowerCase().endsWith(ext))
+  );
+  
+  if (!downloadedFile) {
+    // Try to find most recent file
+    const audioFiles = filesInDir
+      .filter(f => audioExtensions.some(ext => f.toLowerCase().endsWith(ext)))
+      .map(f => ({
+        name: f,
+        path: path.join(outputDir, f),
+        mtime: fs.statSync(path.join(outputDir, f)).mtime.getTime()
+      }))
+      .sort((a, b) => b.mtime - a.mtime);
+    
+    if (audioFiles.length > 0) {
+      const recentFile = audioFiles.find(f => Date.now() - f.mtime < 30000);
+      if (recentFile) {
+        downloadedFile = recentFile.name;
+      }
+    }
+  }
+  
+  if (!downloadedFile) {
+    throw new Error(`Downloaded audio file not found for track: ${spotifyMetadata.title}`);
+  }
+  
+  const filePath = path.join(outputDir, downloadedFile);
+  const absolutePath = path.resolve(filePath);
+  
+  console.log('Audio file downloaded:', absolutePath);
+  
+  // === VERIFY DOWNLOAD MATCHES EXPECTED TRACK ===
+  if (mm) {
+    try {
+      console.log('Verifying downloaded track matches Spotify metadata...');
+      const audioMetadata = await mm.parseFile(absolutePath);
+      const downloadedTitle = audioMetadata.common.title || '';
+      const downloadedArtist = audioMetadata.common.artist || '';
+      
+      console.log('Expected:', spotifyMetadata.title, 'by', spotifyMetadata.artist);
+      console.log('Downloaded:', downloadedTitle, 'by', downloadedArtist);
+      
+      // Simple fuzzy match check
+      const titleMatch = downloadedTitle.toLowerCase().includes(spotifyMetadata.title.toLowerCase().split(' ')[0]) ||
+                         spotifyMetadata.title.toLowerCase().includes(downloadedTitle.toLowerCase().split(' ')[0]);
+      const artistMatch = downloadedArtist.toLowerCase().includes(spotifyMetadata.artist.toLowerCase().split(' ')[0]) ||
+                          spotifyMetadata.artist.toLowerCase().includes(downloadedArtist.toLowerCase().split(' ')[0]);
+      
+      if (!titleMatch && !artistMatch) {
+        console.log('⚠️ WARNING: Downloaded track may not match Spotify track!');
+        console.log('   This might be a cover, remix, or wrong version.');
+      } else {
+        console.log('✅ Track verification passed - looks like a good match');
+      }
+    } catch (verifyError) {
+      console.log('Could not verify track match:', verifyError.message);
+    }
+  }
+  
+  // === BPM DETECTION (same 3-tier as SoundCloud) ===
+  let bpm = null;
+  let key = null;
+  
+  try {
+    console.log('Detecting BPM for Spotify track...');
+    
+    // Try to extract from audio file metadata first
+    if (mm) {
+      try {
+        const metadata = await mm.parseFile(absolutePath);
+        if (metadata.common.bpm) {
+          bpm = Math.round(metadata.common.bpm);
+          console.log('BPM found in audio metadata:', bpm);
+        }
+        
+        key = metadata.common.initialKey || metadata.common.key || null;
+        if (key) {
+          console.log('Key found in audio metadata:', key);
+        }
+      } catch (mmError) {
+        console.log('Error extracting metadata from audio file:', mmError.message);
+      }
+    }
+    
+    // If BPM not found, use aubio detection
+    if (!bpm) {
+      console.log('BPM not in metadata, attempting audio analysis...');
+      bpm = await detectBPMFromAudio(absolutePath);
+      if (bpm) {
+        console.log('BPM detected from audio analysis:', bpm);
+      }
+    }
+    
+    console.log('Final BPM:', bpm, 'Key:', key);
+  } catch (bpmError) {
+    console.log('Error detecting BPM:', bpmError.message);
+  }
+  
+  // === ARTWORK DOWNLOAD ===
+  let artworkPath = null;
+  
+  if (spotifyMetadata.thumbnail) {
+    try {
+      const artworkDir = path.join(app.getPath('userData'), 'artwork');
+      if (!fs.existsSync(artworkDir)) {
+        fs.mkdirSync(artworkDir, { recursive: true });
+      }
+      artworkPath = path.join(artworkDir, `${uniqueId}.jpg`);
+      
+      console.log('Downloading artwork from:', spotifyMetadata.thumbnail);
+      await downloadArtwork(spotifyMetadata.thumbnail, artworkPath);
+      console.log('Artwork downloaded successfully');
+    } catch (artworkError) {
+      console.log('Error downloading artwork:', artworkError.message);
+      artworkPath = null;
+    }
+  }
+  
+  // === WRITE METADATA & EMBED ARTWORK ===
+  try {
+    console.log('Writing metadata to file...');
+    await writeMetadataToFile(absolutePath, {
+      bpm: bpm,
+      key: key,
+      title: spotifyMetadata.title || 'Unknown',
+      artist: spotifyMetadata.allArtists || spotifyMetadata.artist || 'Unknown Artist',
+      artworkPath: artworkPath
+    });
+    console.log('Metadata written successfully');
+  } catch (writeError) {
+    console.log('Error writing metadata:', writeError.message);
+  }
+  
+  // === RETURN TRACK DATA (same format as SoundCloud) ===
+  const trackData = {
+    id: uniqueId,
+    title: spotifyMetadata.title || 'Unknown',
+    artist: spotifyMetadata.allArtists || spotifyMetadata.artist || 'Unknown Artist',
+    duration: spotifyMetadata.duration || 0,
+    currentTime: 0,
+    url: `file://${absolutePath}`,
+    filePath: absolutePath,
+    bpm: bpm || null,
+    key: key || null,
+    artworkPath: artworkPath || null,
+    source: 'spotify',  // Original source
+    downloadSource: downloadSource,  // How it was downloaded (spotdl or youtube-fallback)
+    spotifyUrl: url  // Keep original Spotify URL for re-download if needed
+  };
+  
+  console.log('Returning Spotify track data:', trackData);
+  console.log(`Download method: ${downloadSource}`);
+  return trackData;
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -788,11 +1274,56 @@ function createWindow() {
 
 app.whenReady().then(createWindow);
 
+// Helper function to get spotdl path
+function getSpotdlPath() {
+  // Check common installation paths first
+  const commonPaths = [
+    '/Users/ripo/Library/Python/3.9/bin/spotdl',
+    '/usr/local/bin/spotdl',
+    '/opt/homebrew/bin/spotdl',
+    '/usr/bin/spotdl'
+  ];
+  
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
+  
+  // In production, check for bundled spotdl
+  if (app.isPackaged) {
+    const bundledPath = path.join(process.resourcesPath, 'bin', 'spotdl');
+    if (fs.existsSync(bundledPath)) {
+      return bundledPath;
+    }
+    const altPath = path.join(__dirname, '..', 'bin', 'spotdl');
+    if (fs.existsSync(altPath)) {
+      return altPath;
+    }
+  }
+  
+  // Last resort - try system PATH
+  return 'spotdl';
+}
+
 // Helper function to get yt-dlp path
 function getYtDlpPath() {
   const isWindows = process.platform === 'win32';
   const exeExtension = isWindows ? '.exe' : '';
   const binaryName = 'yt-dlp' + exeExtension;
+  
+  // Check common macOS installation paths first
+  const commonPaths = [
+    '/opt/homebrew/bin/yt-dlp',
+    '/usr/local/bin/yt-dlp',
+    '/usr/bin/yt-dlp'
+  ];
+  
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
   
   // In production, check for bundled yt-dlp
   if (app.isPackaged) {
@@ -806,12 +1337,26 @@ function getYtDlpPath() {
       return altPath;
     }
   }
-  // In development or if bundled version not found, use system yt-dlp
+  
+  // Last resort - try system PATH
   return 'yt-dlp' + exeExtension;
 }
 
 // Helper function to get ffmpeg path
 function getFfmpegPath() {
+  // Check common macOS installation paths first
+  const commonPaths = [
+    '/opt/homebrew/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg',
+    '/usr/bin/ffmpeg'
+  ];
+  
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
+  
   // In production, check for bundled ffmpeg
   if (app.isPackaged) {
     const bundledPath = path.join(process.resourcesPath, 'bin', 'ffmpeg');
@@ -822,24 +1367,27 @@ function getFfmpegPath() {
     if (fs.existsSync(altPath)) {
       return altPath;
     }
-    // Check common macOS installation paths
-    const commonPaths = [
-      '/opt/homebrew/bin/ffmpeg',
-      '/usr/local/bin/ffmpeg',
-      '/usr/bin/ffmpeg'
-    ];
-    for (const p of commonPaths) {
-      if (fs.existsSync(p)) {
-        return p;
-      }
-    }
   }
-  // In development or if bundled version not found, use system ffmpeg
+  
+  // Last resort - try system PATH
   return 'ffmpeg';
 }
 
 // Helper function to get aubio path
 function getAubioPath() {
+  // Check common macOS installation paths first
+  const commonPaths = [
+    '/opt/homebrew/bin/aubio',
+    '/usr/local/bin/aubio',
+    '/usr/bin/aubio'
+  ];
+  
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
+  
   // In production, check for bundled aubio
   if (app.isPackaged) {
     const bundledPath = path.join(process.resourcesPath, 'bin', 'aubio');
@@ -850,19 +1398,9 @@ function getAubioPath() {
     if (fs.existsSync(altPath)) {
       return altPath;
     }
-    // Check common macOS installation paths
-    const commonPaths = [
-      '/opt/homebrew/bin/aubio',
-      '/usr/local/bin/aubio',
-      '/usr/bin/aubio'
-    ];
-    for (const p of commonPaths) {
-      if (fs.existsSync(p)) {
-        return p;
-      }
-    }
   }
-  // In development or if bundled version not found, use system aubio
+  
+  // Last resort - try system PATH
   return 'aubio';
 }
 
@@ -904,9 +1442,24 @@ function cleanSoundCloudUrl(url) {
   }
 }
 
-// Handler untuk menambahkan track SoundCloud
+// Handler untuk menambahkan track (SoundCloud atau Spotify)
 ipcMain.handle('soundcloud:add', async (_, url) => {
   try {
+    // Detect URL source
+    const source = detectUrlSource(url);
+    console.log('URL source detected:', source);
+    
+    if (source === 'unknown') {
+      throw new Error('Unsupported URL. Please provide a SoundCloud or Spotify track URL.');
+    }
+    
+    // Route to appropriate handler
+    if (source === 'spotify') {
+      // Process Spotify track
+      return await processSpotifyTrack(url);
+    }
+    
+    // === SOUNDCLOUD FLOW (EXISTING) ===
     // Clean URL from unnecessary query parameters
     const cleanUrl = cleanSoundCloudUrl(url);
     if (cleanUrl !== url) {
@@ -1460,17 +2013,18 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
       filePath: absolutePath,
       bpm: bpm || null,
       key: key || null,
-      artworkPath: artworkPath || null // Store artwork path for later use
+      artworkPath: artworkPath || null, // Store artwork path for later use
+      source: 'soundcloud' // Add source identifier
     };
     
     console.log('Returning track data:', trackData);
     return trackData;
   } catch (error) {
-    console.error('Error adding SoundCloud track:', error);
+    console.error('Error adding track:', error);
     console.error('Error stack:', error.stack);
     // Provide user-friendly error message
     const errorMessage = error.message || 'Unknown error occurred';
-    throw new Error(`Failed to add SoundCloud track: ${errorMessage}`);
+    throw new Error(`Failed to add track: ${errorMessage}`);
   }
 });
 
