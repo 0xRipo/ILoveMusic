@@ -652,7 +652,8 @@ function detectUrlSource(url) {
   const lowerUrl = url.toLowerCase();
   if (lowerUrl.includes('soundcloud.com')) return 'soundcloud';
   if (lowerUrl.includes('open.spotify.com/track/')) return 'spotify';
-  
+  if (lowerUrl.includes('bandcamp.com')) return 'bandcamp';
+
   return 'unknown';
 }
 
@@ -1450,16 +1451,18 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
     console.log('URL source detected:', source);
     
     if (source === 'unknown') {
-      throw new Error('Unsupported URL. Please provide a SoundCloud or Spotify track URL.');
+      throw new Error('Unsupported URL. Please provide a SoundCloud, Spotify, or Bandcamp track URL.');
     }
-    
+
     // Route to appropriate handler
     if (source === 'spotify') {
       // Process Spotify track
       return await processSpotifyTrack(url);
     }
-    
-    // === SOUNDCLOUD FLOW (EXISTING) ===
+
+    // === SOUNDCLOUD / BANDCAMP FLOW (generic yt-dlp) ===
+    // Bandcamp is yt-dlp-compatible and reuses this exact path; the SoundCloud
+    // and Spotify branches above are untouched.
     // Clean URL from unnecessary query parameters
     const cleanUrl = cleanSoundCloudUrl(url);
     if (cleanUrl !== url) {
@@ -2014,7 +2017,7 @@ ipcMain.handle('soundcloud:add', async (_, url) => {
       bpm: bpm || null,
       key: key || null,
       artworkPath: artworkPath || null, // Store artwork path for later use
-      source: 'soundcloud' // Add source identifier
+      source: source // Detected source: 'soundcloud' or 'bandcamp'
     };
     
     console.log('Returning track data:', trackData);
@@ -2349,6 +2352,296 @@ function escapeXml(unsafe) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
 }
+
+// Resolve the Python interpreter for key detection. Prefer a project-local
+// virtualenv (keeps librosa out of the PEP-668 system environment); otherwise
+// fall back to the system `python3`.
+function resolvePythonCmd() {
+  const candidates = [
+    path.join(__dirname, '.venv', 'bin', 'python3'),
+    path.join(__dirname, 'electron', '.venv', 'bin', 'python3'),
+  ];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) return c;
+    } catch {
+      /* ignore */
+    }
+  }
+  return 'python3';
+}
+
+// Enrich a downloaded track with format, file size, date added, and musical key.
+// Format/size/date are immediate; key detection runs via Python/librosa and
+// degrades gracefully to '—' when librosa or python3 is unavailable.
+ipcMain.handle('enrich-track-metadata', async (_event, filePath) => {
+  const result = {
+    format: null,
+    fileSize: null,
+    dateAdded: new Date().toISOString(),
+    key: null,
+  };
+
+  // Format & file size — synchronous, no external deps
+  try {
+    const stats = fs.statSync(filePath);
+    const ext = path.extname(filePath).replace('.', '').toUpperCase();
+    result.format = ext || '—';
+    result.fileSize = (stats.size / (1024 * 1024)).toFixed(1) + ' MB';
+  } catch (e) {
+    result.format = '—';
+    result.fileSize = '—';
+  }
+
+  // Key detection via Python/librosa
+  await new Promise((resolve) => {
+    const scriptPath = path.join(__dirname, 'electron', 'detect_key.py');
+    execFile(resolvePythonCmd(), [scriptPath, filePath], { timeout: 30000 }, (err, stdout) => {
+      if (!err && stdout) {
+        try {
+          const parsed = JSON.parse(stdout.trim());
+          result.key = parsed.key || '—';
+        } catch {
+          result.key = '—';
+        }
+      } else {
+        result.key = '—';
+      }
+      resolve();
+    });
+  });
+
+  return result;
+});
+
+// Extract embedded ID3 album artwork as a base64 data URL. music-metadata is
+// ESM-only, so it must be loaded via dynamic import() from this CJS module.
+ipcMain.handle('extract-artwork', async (_event, filePath) => {
+  try {
+    const mm = await import('music-metadata');
+    const metadata = await mm.parseFile(filePath, { skipCovers: false });
+    const pictures = metadata.common.picture;
+    const cover = mm.selectCover
+      ? mm.selectCover(pictures)
+      : (pictures && pictures[0]) || null;
+
+    if (!cover) return { artwork: null };
+
+    const base64 = Buffer.from(cover.data).toString('base64');
+    const dataUrl = `data:${cover.format};base64,${base64}`;
+    return { artwork: dataUrl };
+  } catch (e) {
+    console.error('Artwork extraction failed:', e);
+    return { artwork: null };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// macOS trackpad haptics. Electron exposes no NSHapticFeedbackManager binding,
+// so we drive it through a tiny Swift helper. To avoid stuttering during a
+// scrub we compile the helper ONCE (cached on disk) and keep ONE long-lived
+// process alive, writing a single line per haptic to its stdin. No per-tick
+// compile, no process-spawn storm. Degrades to a silent no-op if Swift tooling
+// is unavailable or on non-macOS platforms.
+// ---------------------------------------------------------------------------
+// Objective-C (compiled with clang) rather than Swift: on some toolchains the
+// CLT swiftc/SDK versions mismatch and fail to build AppKit, whereas clang
+// against the macOS SDK is reliable. The helper reads one pattern name per
+// stdin line and fires the corresponding trackpad haptic.
+const HAPTIC_OBJC = `#import <AppKit/AppKit.h>
+#import <string.h>
+int main(void) {
+  @autoreleasepool {
+    id<NSHapticFeedbackPerformer> performer = [NSHapticFeedbackManager defaultPerformer];
+    char line[64];
+    while (fgets(line, sizeof(line), stdin)) {
+      NSHapticFeedbackPattern pattern = NSHapticFeedbackPatternGeneric;
+      if (strncmp(line, "alignment", 9) == 0) pattern = NSHapticFeedbackPatternAlignment;
+      else if (strncmp(line, "levelChange", 11) == 0) pattern = NSHapticFeedbackPatternLevelChange;
+      [performer performFeedbackPattern:pattern performanceTime:NSHapticFeedbackPerformanceTimeNow];
+    }
+  }
+  return 0;
+}
+`;
+
+let hapticProc = null;       // long-lived helper process (stdin-driven)
+let hapticBin = null;        // path to the compiled helper binary
+let hapticInit = null;       // de-dupes concurrent init
+let hapticDisabled = false;  // set when tooling/compile is unavailable
+
+function compileHapticBinary() {
+  return new Promise((resolve) => {
+    try {
+      const dir = app.getPath('userData');
+      const src = path.join(dir, 'haptic-helper.m');
+      const bin = path.join(dir, 'haptic-helper');
+      if (fs.existsSync(bin)) return resolve(bin); // cached across launches
+      fs.writeFileSync(src, HAPTIC_OBJC, 'utf8');
+      execFile(
+        'clang',
+        ['-framework', 'AppKit', '-framework', 'Foundation', '-x', 'objective-c', src, '-o', bin],
+        { timeout: 60000 },
+        (err) => {
+          if (err) {
+            console.warn('Haptic helper compile failed; haptics disabled:', err.message);
+            resolve(null);
+          } else {
+            resolve(bin);
+          }
+        }
+      );
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+function ensureHapticProc() {
+  if (hapticDisabled) return Promise.resolve(null);
+  if (hapticProc && hapticProc.stdin && hapticProc.stdin.writable) {
+    return Promise.resolve(hapticProc);
+  }
+  if (hapticInit) return hapticInit;
+  hapticInit = (async () => {
+    if (!hapticBin) hapticBin = await compileHapticBinary();
+    if (!hapticBin) {
+      hapticDisabled = true;
+      hapticInit = null;
+      return null;
+    }
+    try {
+      const { spawn } = require('child_process');
+      const proc = spawn(hapticBin, [], { stdio: ['pipe', 'ignore', 'ignore'] });
+      proc.on('error', () => { if (hapticProc === proc) hapticProc = null; });
+      proc.on('exit', () => { if (hapticProc === proc) hapticProc = null; });
+      hapticProc = proc;
+    } catch (e) {
+      hapticDisabled = true;
+    }
+    hapticInit = null;
+    return hapticProc;
+  })();
+  return hapticInit;
+}
+
+ipcMain.handle('trigger-haptic', async (_event, type = 'alignment') => {
+  if (process.platform !== 'darwin' || hapticDisabled) return;
+  const proc = await ensureHapticProc();
+  if (!proc || !proc.stdin || !proc.stdin.writable) return;
+  const t = type === 'levelChange' || type === 'alignment' ? type : 'generic';
+  try {
+    proc.stdin.write(t + '\n');
+  } catch (e) {
+    /* helper died mid-write; next call re-spawns it */
+  }
+});
+
+app.on('will-quit', () => {
+  if (hapticProc) {
+    try { hapticProc.stdin.end(); } catch (e) { /* ignore */ }
+    try { hapticProc.kill(); } catch (e) { /* ignore */ }
+    hapticProc = null;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// BPM / Key detection — Layer 1: Spotify Audio Features (env-var creds only).
+// NOTE: Spotify deprecated /audio-features (Nov 2024). Apps created after that
+// get 403; this layer then returns null and the renderer falls back to the
+// existing aubio (BPM) + librosa (key) values. No secrets are hardcoded — uses
+// process.env.SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET (loaded via dotenv).
+// Uses Electron's built-in global fetch (no node-fetch needed/wanted in CJS).
+// ---------------------------------------------------------------------------
+let _spToken = null;
+let _spTokenExp = 0;
+
+async function getSpotifyToken() {
+  if (_spToken && Date.now() < _spTokenExp) return _spToken;
+  const id = process.env.SPOTIFY_CLIENT_ID;
+  const secret = process.env.SPOTIFY_CLIENT_SECRET;
+  if (!id || !secret) return null;
+
+  const credentials = Buffer.from(`${id}:${secret}`).toString('base64');
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  if (!data.access_token) return null;
+  _spToken = data.access_token;
+  _spTokenExp = Date.now() + Math.max(0, (data.expires_in || 3600) - 60) * 1000;
+  return _spToken;
+}
+
+async function getBpmKeyFromSpotify(artist, title) {
+  try {
+    const token = await getSpotifyToken();
+    if (!token) return null;
+    const auth = { Authorization: `Bearer ${token}` };
+
+    const query = encodeURIComponent(`track:${title} artist:${artist}`);
+    const searchRes = await fetch(
+      `https://api.spotify.com/v1/search?q=${query}&type=track&limit=1`,
+      { headers: auth }
+    );
+    if (!searchRes.ok) return null;
+    const searchData = await searchRes.json();
+    const track = searchData?.tracks?.items?.[0];
+    if (!track) return null;
+
+    // Genre from the artist endpoint (NOT deprecated — still 200 OK).
+    let genre = null;
+    const artistId = track.artists?.[0]?.id;
+    if (artistId) {
+      const artistRes = await fetch(`https://api.spotify.com/v1/artists/${artistId}`, { headers: auth });
+      if (artistRes.ok) {
+        const artistData = await artistRes.json();
+        const rawGenre = artistData?.genres?.[0];
+        if (rawGenre) genre = rawGenre.charAt(0).toUpperCase() + rawGenre.slice(1);
+      }
+    }
+
+    // Tempo/key from audio-features (deprecated → 403 → stays null; genre is
+    // still returned so mainstream tracks at least get a genre).
+    let bpm = null;
+    let key = null;
+    const featRes = await fetch(`https://api.spotify.com/v1/audio-features/${track.id}`, { headers: auth });
+    if (featRes.ok) {
+      const feat = await featRes.json();
+      if (feat?.tempo) {
+        const keyNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+        bpm = Math.round(feat.tempo);
+        key = feat.key >= 0 ? `${keyNames[feat.key]} ${feat.mode === 1 ? 'maj' : 'min'}` : null;
+      }
+    } else if (featRes.status === 403) {
+      console.warn('[BPM] Spotify audio-features 403 (deprecated for this app) — returning genre only.');
+    }
+
+    return { bpm, key, genre, source: 'spotify' };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Orchestrator: try Spotify; on miss/unavailable return null so the renderer
+// keeps the existing aubio BPM (set at add time) + librosa key (from enrich).
+ipcMain.handle('detect-bpm-key', async (_event, { artist, title } = {}) => {
+  if (artist && title) {
+    const spotify = await getBpmKeyFromSpotify(artist, title);
+    if (spotify && (spotify.bpm || spotify.key || spotify.genre)) {
+      console.log(`[BPM] Spotify: ${spotify.bpm ? spotify.bpm + ' BPM' : 'no BPM'}, genre ${spotify.genre || 'none'}`);
+      return spotify;
+    }
+  }
+  console.log('[BPM] Spotify miss/unavailable → keeping existing aubio/librosa values');
+  return null;
+});
 
 // Handler untuk menyimpan tracks ke file
 ipcMain.handle('tracks:save', async (_, tracks) => {

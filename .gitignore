@@ -46,3 +46,9 @@ app/
 *.tmp
 *.temp
 
+# Python (key detection venv)
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+

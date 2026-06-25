@@ -1,35 +1,262 @@
 import React, { useState, useRef, useEffect } from 'react';
-import bgVideo from './assets/bg01.mp4';
 
+/* ----------------------------------------------------------------------------
+ * Spatial design tokens (mirrors index.css :root vars; referenced via var())
+ * -------------------------------------------------------------------------- */
+const ACCENT = 'var(--accent)';
+const ACCENT_SOFT = 'var(--accent-soft)';
+const DIM = 'var(--dim)';
+const FAINT = 'var(--faint)';
+const LINE = 'var(--line)';
+const PANEL = 'var(--panel)';
+const INK = 'var(--ink)';
+const MONO = 'var(--mono)';
+
+/* Deterministic per-card cover colours (real tracks carry no artwork data). */
+const PALETTE = [
+  { frame: '#1f6f78', ink: '#ffffff' },
+  { frame: '#c2531f', ink: '#ffffff' },
+  { frame: '#e9e6dd', ink: '#15140f' },
+  { frame: '#1c2b6b', ink: '#ffffff' },
+  { frame: '#211d1a', ink: '#e8b07a' },
+  { frame: '#8fbf1e', ink: '#181c08' },
+  { frame: '#a3247a', ink: '#ffffff' },
+  { frame: '#46525e', ink: '#ffffff' },
+  { frame: '#fff6e3', ink: '#1a1407' },
+  { frame: '#2f3a86', ink: '#ffffff' },
+];
+const colorFor = (id, i) => {
+  const seed = typeof id === 'number' ? id : i;
+  return PALETTE[Math.abs(seed) % PALETTE.length];
+};
+
+/* Deterministic decorative waveform bars (visual only). */
+const makeBars = (seed, n) => {
+  const out = [];
+  for (let j = 0; j < n; j++) {
+    const a = Math.abs(Math.sin(seed * 12.9898 + j * 4.1337) * 43758.5453) % 1;
+    const b = Math.abs(Math.sin(seed * 3.233 + j * 1.7) * 1934.21) % 1;
+    out.push(Math.round(18 + (a * 0.65 + b * 0.35) * 82));
+  }
+  return out;
+};
+
+const clamp = (lo, hi, v) => Math.max(lo, Math.min(hi, v));
+
+// Identify the download source from a pasted URL (used to auto-switch the modal
+// source toggle). The main process re-detects authoritatively before adding.
+const detectSource = (url) => {
+  if (!url) return null;
+  const u = url.toLowerCase();
+  if (u.includes('soundcloud.com')) return 'soundcloud';
+  if (u.includes('spotify.com')) return 'spotify';
+  if (u.includes('bandcamp.com')) return 'bandcamp';
+  return null;
+};
+
+// Source values are stored lowercase ('soundcloud' | 'spotify' | 'bandcamp').
+// Normalize to display label / short badge, tolerating legacy/capitalized values.
+const SOURCE_LABEL = { soundcloud: 'SoundCloud', spotify: 'Spotify', bandcamp: 'Bandcamp' };
+const SOURCE_BADGE = { soundcloud: 'SC', spotify: 'SP', bandcamp: 'BC' };
+const sourceLabel = (s) => (s ? SOURCE_LABEL[String(s).toLowerCase()] || s : '—');
+const sourceBadge = (s) =>
+  s ? SOURCE_BADGE[String(s).toLowerCase()] || String(s).slice(0, 2).toUpperCase() : null;
+
+/* ----------------------------------------------------------------------------
+ * Inline SVG icon set (ported from the redesign)
+ * -------------------------------------------------------------------------- */
+const stroke = (children, sw = 1.45) => (
+  <svg
+    width="17"
+    height="17"
+    viewBox="0 0 17 17"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={sw}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    {children}
+  </svg>
+);
+const ICONS = {
+  library: stroke(
+    <>
+      <rect x="2" y="3" width="13" height="3.2" rx="1.5" />
+      <rect x="2" y="7.5" width="13" height="3.2" rx="1.5" />
+      <rect x="2" y="12" width="13" height="3.2" rx="1.5" />
+    </>
+  ),
+  downloads: stroke(
+    <>
+      <line x1="8.5" y1="2" x2="8.5" y2="11" />
+      <path d="M5 8 L8.5 11.5 L12 8" />
+      <line x1="3" y1="14.5" x2="14" y2="14.5" />
+    </>
+  ),
+  playlists: stroke(
+    <>
+      <line x1="3" y1="4.5" x2="14" y2="4.5" />
+      <line x1="3" y1="8.5" x2="14" y2="8.5" />
+      <line x1="3" y1="12.5" x2="10" y2="12.5" />
+      <circle cx="13" cy="12.5" r="1.7" />
+    </>
+  ),
+  collections: stroke(
+    <>
+      <rect x="2.5" y="2.5" width="5" height="5" rx="1.5" />
+      <rect x="9.5" y="2.5" width="5" height="5" rx="1.5" />
+      <rect x="2.5" y="9.5" width="5" height="5" rx="1.5" />
+      <rect x="9.5" y="9.5" width="5" height="5" rx="1.5" />
+    </>
+  ),
+  bpm: stroke(
+    <>
+      <line x1="3" y1="10" x2="3" y2="12" />
+      <line x1="6" y1="6" x2="6" y2="12" />
+      <line x1="9" y1="3" x2="9" y2="12" />
+      <line x1="12" y1="7" x2="12" y2="12" />
+    </>,
+    1.7
+  ),
+  meta: stroke(
+    <>
+      <rect x="2.5" y="3" width="12" height="11" rx="1.5" />
+      <line x1="5" y1="7" x2="11.5" y2="7" />
+      <line x1="5" y1="10.5" x2="9" y2="10.5" />
+    </>
+  ),
+  settings: stroke(
+    <>
+      <line x1="3" y1="5.5" x2="14" y2="5.5" />
+      <circle cx="6" cy="5.5" r="1.9" fill="#0a0a0c" />
+      <line x1="3" y1="11.5" x2="14" y2="11.5" />
+      <circle cx="11" cy="11.5" r="1.9" fill="#0a0a0c" />
+    </>
+  ),
+  play: (
+    <svg width="15" height="15" viewBox="0 0 15 15" fill="currentColor">
+      <path d="M4 2.5 L12 7.5 L4 12.5 Z" />
+    </svg>
+  ),
+  pause: (
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="currentColor">
+      <rect x="2.5" y="2" width="3" height="9" rx="1" />
+      <rect x="7.5" y="2" width="3" height="9" rx="1" />
+    </svg>
+  ),
+  prev: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+      <rect x="3" y="4" width="1.8" height="8" rx="0.9" />
+      <path d="M13 4 L6 8 L13 12 Z" />
+    </svg>
+  ),
+  next: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M3 4 L10 8 L3 12 Z" />
+      <rect x="11.2" y="4" width="1.8" height="8" rx="0.9" />
+    </svg>
+  ),
+};
+
+/* Diagonal-stripe album-art placeholder (no artwork in the data model yet). */
+const ArtPlaceholder = ({ radius = 0, label }) => (
+  <div
+    style={{
+      position: 'absolute',
+      inset: 0,
+      borderRadius: radius,
+      background:
+        'repeating-linear-gradient(135deg, rgba(0,0,0,0.16) 0 13px, rgba(0,0,0,0.05) 13px 26px)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontFamily: MONO,
+      fontSize: '9px',
+      letterSpacing: '1px',
+      color: FAINT,
+      textTransform: 'uppercase',
+    }}
+  >
+    {label}
+  </div>
+);
+
+/* Compact square album-art slot. Renders artwork when present, otherwise an
+   always-visible placeholder (♪). Implemented inline — no image-slot.js. */
+const AlbumArt = ({ track, size = 52, radius = 9 }) => {
+  const src = track && (track.artwork || track.albumArt);
+  const base = {
+    width: size,
+    height: size,
+    flex: 'none',
+    borderRadius: radius,
+    border: '1px solid rgba(255,255,255,0.08)',
+    boxShadow: '0 4px 14px rgba(0,0,0,0.4)',
+  };
+  if (src) {
+    return <img src={src} alt="" style={{ ...base, objectFit: 'cover' }} />;
+  }
+  return (
+    <div
+      style={{
+        ...base,
+        background: '#1a1a1a',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: 'rgba(255,255,255,0.45)',
+        fontSize: `${Math.round(size * 0.44)}px`,
+        lineHeight: 1,
+      }}
+    >
+      ♪
+    </div>
+  );
+};
 
 const ILoveMusic = () => {
+  /* ===== Existing core state (preserved) ===== */
   const [selected, setSelected] = useState(new Set());
-  const [hoveredButton, setHoveredButton] = useState(null);
-  const [activeTab, setActiveTab] = useState('preview');
   const [pastedUrl, setPastedUrl] = useState('');
   const [playingTrack, setPlayingTrack] = useState(null);
   const [loadingTrack, setLoadingTrack] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
-  
+
   const [tracks, setTracks] = useState([]);
   const [tracksLoaded, setTracksLoaded] = useState(false);
-  
+
   // Search & Filter states
   const [searchQuery, setSearchQuery] = useState('');
   const [filterBpmMin, setFilterBpmMin] = useState('');
   const [filterBpmMax, setFilterBpmMax] = useState('');
   const [filterArtist, setFilterArtist] = useState('');
-  
+
   // Sorting state
-  const [sortBy, setSortBy] = useState('title'); // 'title', 'artist', 'bpm', 'key', 'duration'
+  const [sortBy, setSortBy] = useState('title'); // 'title', 'artist', 'bpm', 'duration'
   const [sortOrder, setSortOrder] = useState('asc'); // 'asc', 'desc'
-  
-  // Editing state
-  const [editingTrack, setEditingTrack] = useState(null);
-  
+
   const audioRefs = useRef({});
   const downloadProgressRef = useRef(0);
+
+  /* ===== New UI-only state (spatial shell) ===== */
+  const [view, setView] = useState('library'); // library | playlists | collections | bpm | settings
+  const [selectedIndex, setSelectedIndex] = useState(0); // focused card (inspector / now-playing)
+  const [editing, setEditing] = useState(false); // inspector edit mode
+  const [downloadOpen, setDownloadOpen] = useState(false); // download modal
+  const [dlSource, setDlSource] = useState('soundcloud'); // soundcloud | spotify | bandcamp
+
+  /* Refs driving the 3D shelf rAF loop without triggering React re-renders. */
+  const stageRef = useRef(null);
+  const sceneRef = useRef(null);
+  const curRef = useRef(0);
+  const targetRef = useRef(0);
+  const lastCRef = useRef(0);
+  const lastTimeRef = useRef(0);
+  const rafRef = useRef(0);
+  const filteredLenRef = useRef(0);
+  const actionsRef = useRef({ togglePlayFocused: () => {} });
 
   // Load tracks from file on mount
   useEffect(() => {
@@ -62,14 +289,14 @@ const ILoveMusic = () => {
         setTracksLoaded(true);
       }
     };
-    
+
     loadTracks();
   }, []);
 
   // Save tracks to file whenever tracks change (but only after initial load)
   useEffect(() => {
     if (!tracksLoaded) return; // Don't save until tracks have been loaded
-    
+
     const saveTracks = async () => {
       try {
         if (window.electron && window.electron.saveTracks) {
@@ -87,20 +314,67 @@ const ILoveMusic = () => {
         console.error('Error saving tracks:', err);
       }
     };
-    
+
     saveTracks();
   }, [tracks, tracksLoaded]);
 
+  // Enrich a freshly-added track with format / file size / date added / key /
+  // artwork, plus a Spotify BPM+key lookup (Layer 1). All resolve, then a single
+  // merge avoids races: Spotify upgrades BPM/key when available; otherwise the
+  // existing aubio BPM (set at add) + librosa key (from enrichment) are kept.
+  const enrichTrack = async (track) => {
+    if (!window.electron) return;
+    const filePath = track.filePath || track.path;
+    if (!filePath) return;
+    try {
+      const [enriched, artworkResult, bpmKey] = await Promise.all([
+        window.electron.enrichTrackMetadata
+          ? window.electron.enrichTrackMetadata(filePath)
+          : Promise.resolve({}),
+        window.electron.extractArtwork
+          ? window.electron.extractArtwork(filePath)
+          : Promise.resolve({ artwork: null }),
+        window.electron.detectBpmKey
+          ? window.electron.detectBpmKey({ filePath, artist: track.artist, title: track.title })
+          : Promise.resolve(null),
+      ]);
+      const spotifyBpm = bpmKey && bpmKey.bpm != null ? bpmKey.bpm : null;
+      const spotifyKey = bpmKey && bpmKey.key ? bpmKey.key : null;
+      const spotifyGenre = bpmKey && bpmKey.genre ? bpmKey.genre : null;
+      setTracks(prev =>
+        prev.map(t =>
+          t.id === track.id
+            ? {
+                ...t,
+                format: enriched.format,
+                fileSize: enriched.fileSize,
+                dateAdded: enriched.dateAdded,
+                artwork: artworkResult.artwork,
+                // Spotify wins; else keep existing aubio BPM / librosa key.
+                bpm: spotifyBpm != null ? spotifyBpm : t.bpm,
+                key: spotifyKey != null ? spotifyKey : (enriched.key != null ? enriched.key : t.key),
+                // Genre only from Spotify, and only if the track has none yet.
+                genre: t.genre != null ? t.genre : spotifyGenre,
+                bpmSource: bpmKey && bpmKey.source ? bpmKey.source : 'aubio',
+              }
+            : t
+        )
+      );
+    } catch (err) {
+      console.error('Metadata enrichment failed:', err);
+    }
+  };
+
   const handleAddSoundCloud = async () => {
     if (!pastedUrl.trim() || loadingTrack) return;
-  
+
     // Check if electron API is available
     if (!window.electron || !window.electron.addSoundCloud) {
       alert('Error: Electron API not available. Please run this app in Electron, not in a regular browser.');
       console.error('window.electron is not available');
       return;
     }
-  
+
     setLoadingTrack(true);
     try {
       const track = await window.electron.addSoundCloud(pastedUrl);
@@ -108,6 +382,8 @@ const ILoveMusic = () => {
       console.log('Track BPM:', track.bpm, 'Track Key:', track.key);
       setTracks(prev => [...prev, track]);
       setPastedUrl('');
+      // Fire-and-forget: fills in format/size/date/key once enrichment resolves.
+      enrichTrack(track);
     } catch (err) {
       let errorMessage = 'Failed to load SoundCloud track';
       if (err.message) {
@@ -126,8 +402,9 @@ const ILoveMusic = () => {
       setLoadingTrack(false);
     }
   };
-  
+
   const formatTime = (seconds) => {
+    if (!seconds || isNaN(seconds)) return '00:00';
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
@@ -135,40 +412,40 @@ const ILoveMusic = () => {
 
   useEffect(() => {
     const cleanupFunctions = [];
-    
+
     tracks.forEach(track => {
       if (audioRefs.current[track.id]) {
         const audio = audioRefs.current[track.id];
-        
+
         const handleLoadedMetadata = () => {
-          setTracks(prev => prev.map(t => 
-            t.id === track.id 
+          setTracks(prev => prev.map(t =>
+            t.id === track.id
               ? { ...t, duration: audio.duration }
               : t
           ));
         };
-        
+
         const updateProgress = () => {
-          setTracks(prev => prev.map(t => 
-            t.id === track.id 
+          setTracks(prev => prev.map(t =>
+            t.id === track.id
               ? { ...t, currentTime: audio.currentTime }
               : t
           ));
         };
-        
+
         const handleEnded = () => {
           setPlayingTrack(null);
-          setTracks(prev => prev.map(t => 
-            t.id === track.id 
+          setTracks(prev => prev.map(t =>
+            t.id === track.id
               ? { ...t, currentTime: 0 }
               : t
           ));
         };
-        
+
         audio.addEventListener('loadedmetadata', handleLoadedMetadata);
         audio.addEventListener('timeupdate', updateProgress);
         audio.addEventListener('ended', handleEnded);
-        
+
         cleanupFunctions.push(() => {
           audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
           audio.removeEventListener('timeupdate', updateProgress);
@@ -176,7 +453,7 @@ const ILoveMusic = () => {
         });
       }
     });
-    
+
     return () => {
       cleanupFunctions.forEach(cleanup => cleanup());
     };
@@ -200,17 +477,17 @@ const ILoveMusic = () => {
       }
       setPlayingTrack(null);
     }
-    
+
     // Remove from selected if selected
     const newSelected = new Set(selected);
     newSelected.delete(id);
     setSelected(newSelected);
-    
+
     // Remove audio ref
     if (audioRefs.current[id]) {
       delete audioRefs.current[id];
     }
-    
+
     // Remove from tracks
     setTracks(prev => prev.filter(t => t.id !== id));
   };
@@ -221,7 +498,7 @@ const ILoveMusic = () => {
         audioRefs.current[key].pause();
       }
     });
-    
+
     if (playingTrack === id) {
       if (audioRefs.current[id]) {
         audioRefs.current[id].pause();
@@ -242,51 +519,72 @@ const ILoveMusic = () => {
 
   const handleProgressClick = (e, track) => {
     if (!audioRefs.current[track.id]) return;
-    
+
     const bar = e.currentTarget;
     const rect = bar.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const percentage = Math.max(0, Math.min(1, clickX / rect.width));
     const newTime = percentage * track.duration;
-    
+
     audioRefs.current[track.id].currentTime = newTime;
-    setTracks(prev => prev.map(t => 
-      t.id === track.id 
+    setTracks(prev => prev.map(t =>
+      t.id === track.id
         ? { ...t, currentTime: newTime }
         : t
     ));
   };
 
+  // Fire-and-forget macOS trackpad haptic. Silent no-op off-macOS or when the
+  // IPC isn't bridged (older preload / no Swift tooling).
+  const triggerHaptic = (type) => {
+    try {
+      window.electron?.triggerHaptic?.(type);
+    } catch (err) {
+      /* never let haptics break scrubbing */
+    }
+  };
+
   const handleProgressMouseDown = (e, track) => {
     if (!audioRefs.current[track.id]) return;
-    
+
     const bar = e.currentTarget;
     const rect = bar.getBoundingClientRect();
-    
+
     const updateProgress = (clientX) => {
       const clickX = clientX - rect.left;
       const percentage = Math.max(0, Math.min(1, clickX / rect.width));
       const newTime = percentage * track.duration;
-      
+
       audioRefs.current[track.id].currentTime = newTime;
-      setTracks(prev => prev.map(t => 
-        t.id === track.id 
+      setTracks(prev => prev.map(t =>
+        t.id === track.id
           ? { ...t, currentTime: newTime }
           : t
       ));
     };
-    
+
+    // Strong "snap" on press.
+    triggerHaptic('levelChange');
     updateProgress(e.clientX);
-    
+
+    // Subtle ticks while dragging, throttled to ~50ms to avoid spamming.
+    let lastHaptic = 0;
     const handleMouseMove = (moveEvent) => {
       updateProgress(moveEvent.clientX);
+      const now = Date.now();
+      if (now - lastHaptic > 50) {
+        triggerHaptic('alignment');
+        lastHaptic = now;
+      }
     };
-    
+
     const handleMouseUp = () => {
+      // Strong "snap" on release.
+      triggerHaptic('levelChange');
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
     };
-    
+
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
   };
@@ -299,7 +597,7 @@ const ILoveMusic = () => {
         setDownloadProgress(progress);
       });
     }
-    
+
     return () => {
       if (window.electron && window.electron.removeDownloadProgressListener) {
         window.electron.removeDownloadProgressListener();
@@ -309,13 +607,13 @@ const ILoveMusic = () => {
 
   const handleDownload = async () => {
     if (selected.size === 0 || downloading) return;
-    
+
     setDownloading(true);
     setDownloadProgress(0);
     downloadProgressRef.current = 0;
     try {
       const trackIds = Array.from(selected);
-      
+
       // Wait for progress to reach 100% before showing success
       const waitForProgress = () => {
         return new Promise((resolve) => {
@@ -330,16 +628,16 @@ const ILoveMusic = () => {
           checkProgress();
         });
       };
-      
+
       // Start download
       const downloadPromise = window.electron.downloadTracks(trackIds, tracks);
-      
+
       // Wait for download to complete
       const result = await downloadPromise;
-      
+
       // Wait for progress to reach 100%
       await waitForProgress();
-      
+
       if (result.success) {
         alert(`Download successful! File saved to Downloads folder.`);
         setSelected(new Set());
@@ -376,7 +674,7 @@ const ILoveMusic = () => {
     // Apply search filter
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase();
-      filtered = filtered.filter(track => 
+      filtered = filtered.filter(track =>
         track.title?.toLowerCase().includes(query) ||
         track.artist?.toLowerCase().includes(query) ||
         track.bpm?.toString().includes(query)
@@ -402,7 +700,7 @@ const ILoveMusic = () => {
     // Sort tracks
     filtered.sort((a, b) => {
       let aVal, bVal;
-      
+
       switch (sortBy) {
         case 'bpm':
           aVal = a.bpm || 0;
@@ -426,7 +724,7 @@ const ILoveMusic = () => {
       }
 
       if (typeof aVal === 'string') {
-        return sortOrder === 'asc' 
+        return sortOrder === 'asc'
           ? aVal.localeCompare(bVal)
           : bVal.localeCompare(aVal);
       } else {
@@ -437,810 +735,857 @@ const ILoveMusic = () => {
     return filtered;
   };
 
-  // Edit track metadata
-  const handleEditTrack = (track) => {
-    setEditingTrack(track);
+  /* Inspector edits: additive UI-layer fields merged onto the track object.
+     Existing data shape is never destructively changed; saveTracks untouched. */
+  const updateTrackField = (id, field, value) => {
+    setTracks(prev => prev.map(t => (t.id === id ? { ...t, [field]: value } : t)));
   };
 
-  const handleSaveEdit = (updatedTrack) => {
-    setTracks(prev => prev.map(t => 
-      t.id === updatedTrack.id ? { ...t, ...updatedTrack } : t
-    ));
-    setEditingTrack(null);
+  /* ===== Derived view data ===== */
+  const filtered = getFilteredAndSortedTracks();
+  const focusIdx = filtered.length ? clamp(0, filtered.length - 1, selectedIndex) : -1;
+  const focused = focusIdx >= 0 ? filtered[focusIdx] : null;
+  const isLibrary = view === 'library';
+  const shelfVisible = isLibrary && filtered.length > 0;
+
+  const focusTo = (i) => {
+    // Animate to the target: nudge targetRef only and let the rAF loop ease
+    // curRef toward it (smooth scroll). The loop updates the focused index as
+    // it crosses/lands on records — no instant snap.
+    targetRef.current = clamp(0, Math.max(0, filteredLenRef.current - 1), i);
   };
 
+  // Keep rAF-loop refs in sync with the latest render (read inside the loop).
+  useEffect(() => {
+    filteredLenRef.current = filtered.length;
+    actionsRef.current.togglePlayFocused = () => {
+      if (focused) handlePlay(focused.id);
+    };
+  });
 
-  
+  /* Lazy artwork backfill: when a track without artwork becomes focused (e.g.
+     an older library entry saved before artwork extraction existed), pull its
+     embedded cover once. Keyed on the focused id so it runs once per track and
+     never loops once artwork is set. */
+  useEffect(() => {
+    if (!focused || focused.artwork) return undefined;
+    const filePath = focused.filePath || focused.path;
+    if (!filePath || !window.electron || !window.electron.extractArtwork) return undefined;
+    let cancelled = false;
+    const fid = focused.id;
+    window.electron
+      .extractArtwork(filePath)
+      .then(result => {
+        if (!cancelled && result && result.artwork) {
+          setTracks(prev => prev.map(t => (t.id === fid ? { ...t, artwork: result.artwork } : t)));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [focused?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // TEMP DIAGNOSTIC — remove once artwork is confirmed. Reveals (a) whether the
+  // running app's preload exposes the extractArtwork IPC (undefined ⇒ Electron
+  // needs a full restart, not just a window reload), and (b) the artwork shape.
+  useEffect(() => {
+    if (!focused) return;
+    console.log(
+      '[artwork] extractArtwork IPC:', typeof window.electron?.extractArtwork,
+      '| value:', focused.artwork ? String(focused.artwork).slice(0, 32) + '…' : focused.artwork,
+      '| type:', typeof focused.artwork
+    );
+  }, [focused?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* 3D shelf animation loop + input listeners. Re-attaches when the shelf
+     mounts/unmounts. rAF and listeners are torn down on cleanup (no leaks). */
+  useEffect(() => {
+    if (!shelfVisible) return undefined;
+
+    // Clamp persisted scroll position into range for the current list.
+    const maxI = Math.max(0, filteredLenRef.current - 1);
+    curRef.current = clamp(0, maxI, curRef.current);
+    targetRef.current = clamp(0, maxI, targetRef.current);
+
+    const loop = () => {
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - lastTimeRef.current) / 1000);
+      lastTimeRef.current = now;
+
+      curRef.current += (targetRef.current - curRef.current) * Math.min(1, dt * 9);
+      const scene = sceneRef.current;
+      if (scene) {
+        const cards = scene.querySelectorAll('[data-card]');
+        for (let k = 0; k < cards.length; k++) {
+          const el = cards[k];
+          const i = +el.dataset.index;
+          const d = i - curRef.current;
+          const ad = Math.abs(d);
+          const focus = Math.max(0, 1 - ad);
+          // Tunnel layout (the only shelf mode).
+          const ty = -d * 134;
+          const tz = 62 - ad * 250;
+          const rx = 52 - focus * 15;
+          const sc = (1 - Math.min(0.52, ad * 0.052)) * (1 + focus * 0.03);
+          const tf = `translate3d(0,${ty}px,${tz}px) rotateX(${rx}deg) scale(${sc})`;
+          const op = Math.max(0.04, Math.min(1, 1.16 - ad * 0.17));
+          el.style.transform = tf;
+          el.style.opacity = op;
+          el.style.filter = ad > 2.5 ? `blur(${Math.min(5, (ad - 2.5) * 2.1)}px)` : 'none';
+          // Authoritative paint order: nearer the focus ⇒ higher z-index. The
+          // scene is now a flat stacking context (no preserve-3d), so z-index —
+          // not 3D position — decides which card paints on top. Strictly
+          // monotonic in `ad`, so the focused card is always frontmost and no
+          // card ever paints in front of one visually closer to the viewer.
+          el.style.zIndex = String(10000 - Math.round(ad * 100));
+          // Only visibly-sharp cards intercept clicks: keeps click-to-pull for
+          // near cards while preventing phantom hits from faded/back cards.
+          el.style.pointerEvents = ad < 2.5 ? 'auto' : 'none';
+        }
+      }
+
+      const len = filteredLenRef.current;
+      const c = clamp(0, Math.max(0, len - 1), Math.round(curRef.current));
+      if (c !== lastCRef.current) {
+        lastCRef.current = c;
+        setSelectedIndex(c);
+        // One haptic per record change (never per scroll tick). First/last
+        // record get a firmer "edge snap"; everything between is a subtle tick.
+        const atEdge = c === 0 || c === Math.max(0, len - 1);
+        triggerHaptic(atEdge ? 'levelChange' : 'alignment');
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    };
+
+    const stage = stageRef.current;
+    const onWheel = (e) => {
+      e.preventDefault();
+      const max = Math.max(0, filteredLenRef.current - 1);
+      targetRef.current = clamp(0, max, targetRef.current + e.deltaY * 0.0055);
+    };
+    const onKey = (e) => {
+      const max = Math.max(0, filteredLenRef.current - 1);
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        targetRef.current = Math.min(max, Math.round(targetRef.current) + 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        targetRef.current = Math.max(0, Math.round(targetRef.current) - 1);
+      } else if (e.key === ' ') {
+        e.preventDefault();
+        actionsRef.current.togglePlayFocused();
+      }
+    };
+
+    if (stage) stage.addEventListener('wheel', onWheel, { passive: false });
+    window.addEventListener('keydown', onKey);
+
+    lastTimeRef.current = performance.now();
+    rafRef.current = requestAnimationFrame(loop);
+
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      if (stage) stage.removeEventListener('wheel', onWheel);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [shelfVisible]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* Now-playing / inspector progress derived from real audio state. */
+  const npProgress =
+    focused && focused.duration > 0 ? (focused.currentTime || 0) / focused.duration : 0;
+  const focusedColor = focused ? colorFor(focused.id, focusIdx) : { frame: '#1a1a1d', ink: '#fff' };
+  const isFocusedPlaying = focused && playingTrack === focused.id;
+  const isFocusedSelected = focused && selected.has(focused.id);
+  const waveBars = makeBars((focusIdx >= 0 ? focusIdx : 0) + 1, 58);
+
+  const stub = null;
+
+  /* Inspector BPM/KEY stat cards — fixed size so they never resize with
+     content (e.g. "F# min" vs "128"). Both cards identical; value never wraps. */
+  const statCardStyle = (bg, border) => ({
+    flex: 1,
+    height: '96px',
+    minHeight: '96px',
+    maxHeight: '96px',
+    boxSizing: 'border-box',
+    padding: '14px',
+    borderRadius: '12px',
+    display: 'flex',
+    flexDirection: 'column',
+    justifyContent: 'flex-end',
+    overflow: 'hidden',
+    background: bg,
+    border: `1px solid ${border}`,
+  });
+  const statValueStyle = {
+    fontFamily: MONO,
+    fontSize: 'clamp(20px, 2.2vw, 28px)',
+    fontWeight: 600,
+    lineHeight: 1,
+    marginTop: '6px',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  };
+
+  /* Shared small style helpers */
+  const fieldStyle = {
+    background: 'rgba(255,255,255,0.04)',
+    border: `1px solid ${LINE}`,
+    color: '#fff',
+    borderRadius: '8px',
+    padding: '8px 11px',
+    fontSize: '12px',
+    fontFamily: MONO,
+    outline: 'none',
+  };
+
+  const metaRows = focused
+    ? [
+        { k: 'DURATION', v: formatTime(focused.duration) },
+        { k: 'KEY', v: focused.key || '—' },
+        { k: 'GENRE', v: focused.genre || '—' },
+        { k: 'FILE SIZE', v: focused.fileSize || '—' },
+        { k: 'FORMAT', v: focused.format || '—' },
+        { k: 'SOURCE', v: sourceLabel(focused.source) },
+        { k: 'DATE ADDED', v: focused.dateAdded ? new Date(focused.dateAdded).toLocaleDateString() : '—' },
+      ]
+    : [];
+
   return (
-    <div style={{
-      fontFamily: '"SF Mono", "Monaco", "Inconsolata", "Roboto Mono", "Courier New", monospace',
-      position: 'relative',
-      minHeight: '100vh',
-      width: '100vw',
-      padding: '0',
-      margin: '0',
-      color: '#1a1a1a',
-      display: 'flex',
-      flexDirection: 'column',
-      overflow: 'hidden',
-      overflowX: 'hidden'
-    }}>
-      {/* Video Background */}
-      <video
-        autoPlay
-        loop
-        muted
-        playsInline
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        display: 'grid',
+        gridTemplateColumns: '1fr 338px',
+        background: 'var(--bg)',
+        color: INK,
+        fontFamily: "'Space Grotesk', -apple-system, sans-serif",
+        overflow: 'hidden',
+      }}
+    >
+      {/* Hidden audio elements (one per track) */}
+      <div style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }}>
+        {tracks.map(track => (
+          <audio
+            key={track.id}
+            ref={el => {
+              if (el) {
+                audioRefs.current[track.id] = el;
+                el.addEventListener('error', (e) => {
+                  console.error('Audio load error:', e);
+                  setTracks(prev => prev.map(t =>
+                    t.id === track.id ? { ...t, error: true } : t
+                  ));
+                });
+              }
+            }}
+            src={track.url}
+            preload="metadata"
+            crossOrigin="anonymous"
+          />
+        ))}
+      </div>
+
+      {/* ===================== MAIN ===================== */}
+      <main
         style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          width: '100%',
-          height: '100%',
-          objectFit: 'cover',
-          zIndex: -1,
-          pointerEvents: 'none'
+          position: 'relative',
+          display: 'flex',
+          flexDirection: 'column',
+          minWidth: 0,
+          background: 'radial-gradient(120% 80% at 50% 8%, #131216 0%, #0a0a0c 52%, #060607 100%)',
         }}
       >
-        <source src={bgVideo} type="video/mp4" />
-      </video>
-      
-      {/* Content Container */}
-      <div style={{
-        position: 'relative',
-        zIndex: 1,
-        width: '100%',
-        height: '100%',
-        display: 'flex',
-        flexDirection: 'column'
-      }}>
-      {tracks.map(track => (
-        <audio 
-          key={track.id}
-          ref={el => {
-            if (el) {
-              audioRefs.current[track.id] = el;
-              // Handle error loading audio
-              el.addEventListener('error', (e) => {
-                console.error('Audio load error:', e);
-                setTracks(prev => prev.map(t => 
-                  t.id === track.id ? { ...t, error: true } : t
-                ));
-              });
-            }
-          }}
-          src={track.url}
-          preload="metadata"
-          crossOrigin="anonymous"
-        />
-      ))}
-
-      <div style={{
-        padding: '20px 32px',
-        display: 'flex',
-        gap: '8px',
-        alignItems: 'center',
-        borderBottom: '1px solid #1a1a1a',
-        backgroundColor: '#fff',
-        borderRadius: 0
-      }}>
-        <input
-          type="text"
-          value={pastedUrl}
-          onChange={(e) => setPastedUrl(e.target.value)}
-          placeholder="PASTE SOUNDCLOUD OR SPOTIFY URL"  // CHANGED: Support both SoundCloud and Spotify
-          onKeyPress={(e) => {
-            if (e.key === 'Enter') {
-              handleAddSoundCloud();
-            }
-          }}
-          disabled={loadingTrack}
+        <header
           style={{
-            fontFamily: 'inherit',
-            fontSize: '11px',
-            letterSpacing: '0.01em',
-            padding: '10px 14px',
-            border: 'none',
-            backgroundColor: '#1a1a1a',
-            color: '#fff',
-            flex: 1,
-            outline: 'none',
-            textTransform: 'uppercase',
-            borderRadius: 0
+            display: 'flex',
+            alignItems: 'center',
+            gap: '18px',
+            padding: '18px 26px',
+            borderBottom: `1px solid ${LINE}`,
+            zIndex: 20,
+            background: 'rgba(8,8,10,0.4)',
+            backdropFilter: 'blur(8px)',
           }}
-        />
-        <button 
-          style={{
-            fontFamily: 'inherit',
-            fontSize: '11px',
-            letterSpacing: '0.02em',
-            textTransform: 'uppercase',
-            padding: '10px 32px',
-            border: 'none',
-            backgroundColor: hoveredButton === 'add' ? '#fff' : '#1a1a1a',
-            color: hoveredButton === 'add' ? '#1a1a1a' : '#fff',
-            cursor: loadingTrack ? 'wait' : 'pointer',
-            transition: 'all 0.2s ease-out',
-            outline: hoveredButton === 'add' ? '1px solid #1a1a1a' : 'none',
-            opacity: loadingTrack ? 0.6 : 1,
-            borderRadius: 0
-          }}
-          onClick={handleAddSoundCloud}
-          onMouseEnter={() => !loadingTrack && setHoveredButton('add')}
-          onMouseLeave={() => setHoveredButton(null)}
-          disabled={loadingTrack}
         >
-          {loadingTrack ? 'LOADING...' : 'ADD'}
-        </button>
-      </div>
-
-      <div style={{
-        flex: 1,
-        padding: '32px 48px',
-        maxWidth: '1200px',
-        width: '100%',
-        margin: '0 auto',
-        boxSizing: 'border-box',
-        overflowX: 'hidden'
-      }}>
-
-      <div style={{
-        display: 'flex',
-        gap: '12px',
-        marginBottom: '32px'
-      }}>
-        {['about', 'preview'].map((item) => {
-          const isActive = activeTab === item;
-          return (
-            <button 
-              key={item} 
-              onClick={() => setActiveTab(item)}
+          {/* Inline library status (flush — no card container) */}
+          <div style={{ minWidth: '240px', maxWidth: '440px', flexShrink: 0 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '16px' }}>
+              <span style={{ fontSize: '15px', fontWeight: 600, letterSpacing: '0.3px' }}>LIBRARY</span>
+              <span style={{ fontFamily: MONO, fontSize: '12px', color: ACCENT }}>{tracks.length} TRACKS</span>
+            </div>
+            <div style={{ height: '5px', borderRadius: '5px', background: 'rgba(255,255,255,0.07)', overflow: 'hidden', marginTop: '7px' }}>
+              <div style={{ width: `${Math.min(100, tracks.length * 6)}%`, height: '100%', background: 'linear-gradient(90deg,var(--accent),#caa055)' }} />
+            </div>
+            <div style={{ fontFamily: MONO, fontSize: '10px', color: FAINT, marginTop: '6px', letterSpacing: '0.5px' }}>
+              {selected.size} SELECTED · LOCAL DISK
+            </div>
+          </div>
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '14px' }}>
+            <button
+              onClick={() => setDownloadOpen(true)}
               style={{
-                fontFamily: 'inherit',
-                fontSize: '11px',
-                letterSpacing: '0.02em',
-                textTransform: 'uppercase',
-                backgroundColor: isActive ? '#1a1a1a' : '#fff',
-                color: isActive ? '#fff' : '#1a1a1a',
-                border: isActive ? '1px solid #fff' : '1px solid #1a1a1a',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '7px',
+                border: 'none',
                 cursor: 'pointer',
-                padding: '10px 20px',
-                borderRadius: 0,
-                outline: 'none'
+                fontFamily: 'inherit',
+                fontSize: '13px',
+                fontWeight: 500,
+                padding: '8px 15px',
+                borderRadius: '9px',
+                background: ACCENT,
+                color: '#1a1407',
+                boxShadow: `0 4px 16px ${ACCENT_SOFT}`,
               }}
             >
-              {item}
+              <span style={{ fontSize: '15px', lineHeight: 1, marginTop: '-1px' }}>+</span> Download
             </button>
-          );
-        })}
-      </div>
+            <button
+              onClick={() => setView(view === 'settings' ? 'library' : 'settings')}
+              title="Settings"
+              aria-label="Settings"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '36px',
+                height: '36px',
+                border: `1px solid ${LINE}`,
+                background: view === 'settings' ? ACCENT_SOFT : 'rgba(255,255,255,0.04)',
+                color: view === 'settings' ? ACCENT : DIM,
+                borderRadius: '9px',
+                cursor: 'pointer',
+                flexShrink: 0,
+              }}
+            >
+              {ICONS.settings}
+            </button>
+          </div>
+        </header>
 
-      {activeTab === 'about' && (
-        <div style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          minHeight: '400px',
-          gap: '24px'
-        }}>
-          <h1 style={{
-            fontSize: '12px',
-            fontWeight: '700',
-            letterSpacing: '0.01em',
-            textTransform: 'uppercase',
-            color: '#fff',
-            margin: -10,
-            textAlign: 'center'
-          }}>
-            MADE BY LOVE ILOVEMUSIC   ❤️   RIPO
-          </h1>
-          
-          <a
-            href="https://www.instagram.com/cactusdomain/"
-            target="_blank"
-            rel="noopener noreferrer"
+        {/* Search / filter / sort toolbar (library only) */}
+        {isLibrary && (
+          <div
             style={{
-              fontFamily: 'inherit',
-              fontSize: '14px',
-              letterSpacing: '0.02em',
-              textTransform: 'uppercase',
-              padding: '14px 40px',
-              border: '2px solid #1a1a1a',
-              backgroundColor: '#fff',
-              color: '#1a1a1a',
-              textDecoration: 'none',
-              transition: 'all 0.2s ease-out',
-              borderRadius: 0,
-              fontWeight: '600',
-              display: 'inline-block'
-            }}
-            onMouseEnter={(e) => {
-              e.target.style.backgroundColor = '#1a1a1a';
-              e.target.style.color = '#fff';
-            }}
-            onMouseLeave={(e) => {
-              e.target.style.backgroundColor = '#fff';
-              e.target.style.color = '#1a1a1a';
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '10px 26px',
+              borderBottom: `1px solid ${LINE}`,
+              flexWrap: 'wrap',
+              zIndex: 20,
+              background: 'rgba(8,8,10,0.35)',
             }}
           >
-            @CACTUSDOMAIN
-          </a>
-        </div>
-      )}
-
-      {activeTab === 'preview' && (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-        {/* Search & Filter Section */}
-        <div style={{
-          backgroundColor: '#fff',
-          padding: '16px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '12px',
-          marginBottom: '16px'
-        }}>
-          {/* Search Bar */}
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="SEARCH TRACKS..."
-              style={{
-                fontFamily: 'inherit',
-                fontSize: '11px',
-                padding: '8px 12px',
-                border: '1px solid #1a1a1a',
-                backgroundColor: '#fff',
-                color: '#1a1a1a',
-                flex: 1,
-                outline: 'none',
-                textTransform: 'uppercase'
-              }}
+              placeholder="Search tracks…"
+              style={{ ...fieldStyle, flex: 1, minWidth: '160px' }}
             />
-            <button
-              onClick={handleToggleSelectAll}
-              style={{
-                fontSize: '11px',
-                padding: '8px 16px',
-                border: '1px solid #1a1a1a',
-                backgroundColor: selected.size === tracks.length ? '#1a1a1a' : '#fff',
-                color: selected.size === tracks.length ? '#fff' : '#1a1a1a',
-                cursor: 'pointer',
-                textTransform: 'uppercase'
-              }}
-            >
-              {selected.size === tracks.length ? 'DESELECT ALL' : 'SELECT ALL'}
-            </button>
-          </div>
-
-          {/* Filters */}
-          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
             <input
               type="number"
               value={filterBpmMin}
               onChange={(e) => setFilterBpmMin(e.target.value)}
               placeholder="BPM MIN"
-              style={{
-                fontSize: '11px',
-                padding: '6px 10px',
-                border: '1px solid #1a1a1a',
-                width: '80px',
-                outline: 'none',
-                textTransform: 'uppercase'
-              }}
+              style={{ ...fieldStyle, width: '92px' }}
             />
             <input
               type="number"
               value={filterBpmMax}
               onChange={(e) => setFilterBpmMax(e.target.value)}
               placeholder="BPM MAX"
-              style={{
-                fontSize: '11px',
-                padding: '6px 10px',
-                border: '1px solid #1a1a1a',
-                width: '80px',
-                outline: 'none',
-                textTransform: 'uppercase'
-              }}
+              style={{ ...fieldStyle, width: '92px' }}
             />
             <input
               type="text"
               value={filterArtist}
               onChange={(e) => setFilterArtist(e.target.value)}
-              placeholder="ARTIST"
-              style={{
-                fontSize: '11px',
-                padding: '6px 10px',
-                border: '1px solid #1a1a1a',
-                flex: 1,
-                outline: 'none',
-                textTransform: 'uppercase'
-              }}
+              placeholder="Artist"
+              style={{ ...fieldStyle, width: '120px' }}
             />
-          </div>
-
-          {/* Sort Controls */}
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            <span style={{ fontSize: '11px', textTransform: 'uppercase' }}>SORT BY:</span>
-            <select
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value)}
-              style={{
-                fontSize: '11px',
-                padding: '6px 10px',
-                border: '1px solid #1a1a1a',
-                backgroundColor: '#fff',
-                outline: 'none',
-                textTransform: 'uppercase'
-              }}
-            >
-              <option value="title">TITLE</option>
-              <option value="artist">ARTIST</option>
-              <option value="bpm">BPM</option>
-              <option value="duration">DURATION</option>
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={{ ...fieldStyle }}>
+              <option value="title" style={{ background: '#1a1a1a' }}>TITLE</option>
+              <option value="artist" style={{ background: '#1a1a1a' }}>ARTIST</option>
+              <option value="bpm" style={{ background: '#1a1a1a' }}>BPM</option>
+              <option value="duration" style={{ background: '#1a1a1a' }}>DURATION</option>
             </select>
             <button
               onClick={() => setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')}
-              style={{
-                fontSize: '11px',
-                padding: '6px 12px',
-                border: '1px solid #1a1a1a',
-                backgroundColor: '#fff',
-                cursor: 'pointer',
-                textTransform: 'uppercase'
-              }}
+              style={{ ...fieldStyle, cursor: 'pointer', color: ACCENT }}
             >
               {sortOrder === 'asc' ? '↑ ASC' : '↓ DESC'}
             </button>
-          </div>
-        </div>
-
-        {/* Track List */}
-        {getFilteredAndSortedTracks().map((track) => {
-          const isSelected = selected.has(track.id);
-          const isPlaying = playingTrack === track.id;
-          const progress = track.duration > 0 ? track.currentTime / track.duration : 0;
-          
-          return (
-            <div
-              key={track.id}
+            <button
+              onClick={handleToggleSelectAll}
               style={{
-                display: 'flex',
-                alignItems: 'center',
-                backgroundColor: '#fff',
-                padding: '16px',
-                gap: '16px',
-                border: 'none',
-                borderRadius: 0
+                ...fieldStyle,
+                cursor: 'pointer',
+                color: selected.size === tracks.length && tracks.length ? '#1a1407' : '#fff',
+                background: selected.size === tracks.length && tracks.length ? ACCENT : 'rgba(255,255,255,0.04)',
               }}
             >
-              <button
-                onClick={() => handlePlay(track.id)}
+              {selected.size === tracks.length && tracks.length ? 'DESELECT ALL' : 'SELECT ALL'}
+            </button>
+          </div>
+        )}
+
+        {/* ===== Library shelf ===== */}
+        {isLibrary && filtered.length > 0 && (
+          <div
+            ref={stageRef}
+            style={{
+              position: 'relative',
+              flex: 1,
+              minHeight: 0,
+              overflow: 'hidden',
+            }}
+          >
+            <div
+              ref={sceneRef}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                // Perspective lives here (the cards' direct parent) and the scene
+                // is left as a *flat* stacking context (no preserve-3d) so paint
+                // order follows z-index rather than 3D Z. `isolation: isolate`
+                // keeps card z-indices from leaking into sibling UI.
+                perspective: '1750px',
+                perspectiveOrigin: '50% 33%',
+                isolation: 'isolate',
+              }}
+            >
+              {filtered.map((t, i) => {
+                const c = colorFor(t.id, i);
+                return (
+                  <div
+                    key={t.id}
+                    data-card="1"
+                    data-index={i}
+                    onClick={() => { triggerHaptic('levelChange'); focusTo(i); }}
+                    style={{
+                      position: 'absolute',
+                      left: '50%',
+                      top: '43%',
+                      width: '466px',
+                      height: '288px',
+                      margin: '-144px 0 0 -233px',
+                      cursor: 'pointer',
+                      willChange: 'transform, opacity, z-index',
+                    }}
+                  >
+                    {/* Flat "stacked vinyl" edge — 2D offsets (not translateZ) so
+                        the card stays a flat layer and never z-fights neighbours. */}
+                    <div style={{ position: 'absolute', inset: 0, transform: 'translateY(8px) scale(0.97)', background: '#050506', borderRadius: '13px', boxShadow: '0 50px 90px rgba(0,0,0,0.7)' }} />
+                    <div style={{ position: 'absolute', inset: 0, transform: 'translateY(4px) scale(0.985)', background: `color-mix(in srgb, ${c.frame} 55%, #000)`, borderRadius: '13px' }} />
+                    <div style={{ position: 'absolute', inset: 0, borderRadius: '13px', overflow: 'hidden', background: c.frame, border: '1px solid rgba(255,255,255,0.12)', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18)' }}>
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', padding: '13px 18px 11px', color: c.ink }}>
+                        <span style={{ fontWeight: 700, fontSize: '17px', letterSpacing: '-0.2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                        <span style={{ fontSize: '14px', opacity: 0.72, whiteSpace: 'nowrap' }}>{t.artist}</span>
+                        <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                          {sourceBadge(t.source) && (
+                            <span style={{ fontFamily: MONO, fontSize: '9px', fontWeight: 700, letterSpacing: '0.5px', color: c.ink, opacity: 0.85, padding: '1px 5px', borderRadius: '4px', border: `1px solid ${c.ink}`, lineHeight: 1.5 }}>
+                              {sourceBadge(t.source)}
+                            </span>
+                          )}
+                          <span style={{ fontFamily: MONO, fontSize: '11px', opacity: 0.62, whiteSpace: 'nowrap' }}>
+                            {t.bpm ? `${t.bpm} BPM` : '—'}{t.key ? ` · ${t.key}` : ''}
+                          </span>
+                        </span>
+                      </div>
+                      <div style={{ position: 'absolute', left: '14px', right: '14px', bottom: '14px', top: '46px', borderRadius: '8px', overflow: 'hidden', background: 'repeating-linear-gradient(135deg, rgba(0,0,0,0.13) 0 11px, rgba(0,0,0,0.05) 11px 22px)' }}>
+                        {t.artwork ? (
+                          <img src={t.artwork} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+                        ) : (
+                          <ArtPlaceholder radius={8} label="album art" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Vignette */}
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                pointerEvents: 'none',
+                background:
+                  'linear-gradient(to bottom, transparent 58%, rgba(6,6,7,0.82) 86%, #060607 99%), radial-gradient(115% 72% at 50% 38%, transparent 50%, rgba(6,6,7,0.5) 84%, rgba(6,6,7,0.9) 100%)',
+              }}
+            />
+
+            {/* Now-playing dock */}
+            <div style={{ position: 'absolute', left: 0, right: 0, bottom: '26px', display: 'flex', justifyContent: 'center', pointerEvents: 'none', zIndex: 30 }}>
+              <div
                 style={{
-                  width: '32px',
-                  height: '32px',
-                  border: 'none',
-                  backgroundColor: 'transparent',
-                  cursor: 'pointer',
+                  pointerEvents: 'auto',
                   display: 'flex',
                   alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: '12px',
-                  flexShrink: 0,
-                  padding: 0,
-                  outline: 'none'
-                }}
-                onFocus={(e) => e.target.style.outline = 'none'}
-                onBlur={(e) => e.target.style.outline = 'none'}
-              >
-                {isPlaying ? (
-                  <span style={{ display: 'flex', gap: '2px' }}>
-                    <span style={{ width: '3px', height: '10px', backgroundColor: '#1a1a1a' }}></span>
-                    <span style={{ width: '3px', height: '10px', backgroundColor: '#1a1a1a' }}></span>
-                  </span>
-                ) : (
-                  <span style={{
-                    width: 0,
-                    height: 0,
-                    borderLeft: '8px solid #1a1a1a',
-                    borderTop: '6px solid transparent',
-                    borderBottom: '6px solid transparent',
-                    marginLeft: '2px'
-                  }}></span>
-                )}
-              </button>
-
-              <div style={{ flex: 1, minWidth: 0, backgroundColor: '#fff' }}>
-                <div style={{
-                  fontSize: '12px',
-                  letterSpacing: '0.01em',
-                  marginBottom: '4px',
+                  gap: '14px',
+                  width: '660px',
+                  maxWidth: 'calc(100% - 40px)',
+                  minWidth: 0,
+                  boxSizing: 'border-box',
                   overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  color: '#1a1a1a',
-                  textTransform: 'uppercase'
-                }}>
-                  {track.title} - {track.artist}
+                  padding: '11px 16px',
+                  borderRadius: '16px',
+                  background: 'rgba(14,14,17,0.82)',
+                  backdropFilter: 'blur(20px)',
+                  border: '1px solid rgba(255,255,255,0.09)',
+                  boxShadow: '0 18px 50px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.06)',
+                }}
+              >
+                <AlbumArt track={focused} size={46} radius={9} />
+                <div style={{ flex: '0 1 130px', minWidth: 0 }}>
+                  <div style={{ fontSize: '13px', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{focused ? focused.title : '—'}</div>
+                  <div style={{ fontSize: '11.5px', color: DIM, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{focused ? focused.artist : ''}</div>
                 </div>
-                {track.bpm && (
-                  <div style={{
-                    fontSize: '10px',
-                    color: '#666',
-                    marginBottom: '4px',
-                    display: 'flex',
-                    gap: '12px',
-                    alignItems: 'center',
-                    textTransform: 'uppercase'
-                  }}>
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                      <span style={{ fontWeight: '600' }}>BPM:</span>
-                      <span>{track.bpm}</span>
-                    </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 'none', flexShrink: 0 }}>
+                  <button onClick={() => focusTo(Math.max(0, focusIdx - 1))} style={{ border: 'none', background: 'none', cursor: 'pointer', color: DIM, display: 'flex', padding: '4px' }}>{ICONS.prev}</button>
+                  <button
+                    onClick={() => focused && handlePlay(focused.id)}
+                    style={{ width: '38px', height: '38px', borderRadius: '50%', border: 'none', cursor: 'pointer', background: ACCENT, color: '#1a1407', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: `0 0 18px ${ACCENT_SOFT}`, flexShrink: 0 }}
+                  >
+                    {isFocusedPlaying ? ICONS.pause : ICONS.play}
+                  </button>
+                  <button onClick={() => focusTo(Math.min(filtered.length - 1, focusIdx + 1))} style={{ border: 'none', background: 'none', cursor: 'pointer', color: DIM, display: 'flex', padding: '4px' }}>{ICONS.next}</button>
+                </div>
+                <div style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, width: '36px', flexShrink: 0, textAlign: 'right' }}>{focused ? formatTime(focused.currentTime) : '0:00'}</span>
+                  <div
+                    onMouseDown={(e) => focused && handleProgressMouseDown(e, focused)}
+                    onClick={(e) => focused && handleProgressClick(e, focused)}
+                    style={{ position: 'relative', flex: '1 1 auto', minWidth: 0, height: '30px', overflow: 'hidden', display: 'flex', alignItems: 'center', gap: '1.5px', cursor: 'pointer' }}
+                  >
+                    {waveBars.map((h, bi) => (
+                      <div key={bi} style={{ flex: 1, minWidth: '1px', borderRadius: '1.5px', background: ACCENT, height: `${h}%`, opacity: 0.92 }} />
+                    ))}
+                    <div style={{ position: 'absolute', top: 0, bottom: 0, right: 0, left: `${npProgress * 100}%`, background: 'rgba(13,13,16,0.66)', borderRadius: '3px', pointerEvents: 'none' }} />
+                    <div style={{ position: 'absolute', top: '-2px', bottom: '-2px', left: `${npProgress * 100}%`, width: '2px', background: '#fff', boxShadow: '0 0 8px rgba(255,255,255,0.6)', pointerEvents: 'none' }} />
+                  </div>
+                  <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, width: '36px', flexShrink: 0 }}>{focused ? formatTime(focused.duration) : '0:00'}</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flex: 'none', flexShrink: 0, padding: '5px 11px', borderRadius: '9px', background: ACCENT_SOFT, border: '1px solid rgba(230,178,76,0.2)' }}>
+                  <span style={{ fontFamily: MONO, fontWeight: 600, fontSize: '15px', color: ACCENT, lineHeight: 1 }}>{focused && focused.bpm ? focused.bpm : '—'}</span>
+                  <span style={{ fontFamily: MONO, fontSize: '8.5px', color: ACCENT, opacity: 0.7, letterSpacing: '0.5px' }}>BPM</span>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ position: 'absolute', left: 0, right: 0, top: '18px', textAlign: 'center', pointerEvents: 'none', fontFamily: MONO, fontSize: '10px', letterSpacing: '2px', color: FAINT }}>
+              ↑ &nbsp;DIGGING THROUGH {filtered.length} RECORDS&nbsp; ↓
+            </div>
+            <div style={{ position: 'absolute', left: 0, right: 0, bottom: '118px', textAlign: 'center', pointerEvents: 'none', fontFamily: MONO, fontSize: '10.5px', letterSpacing: '1px', color: DIM }}>
+              scroll to dig &nbsp;·&nbsp; click a record to pull it
+            </div>
+          </div>
+        )}
+
+        {/* ===== Library empty state ===== */}
+        {isLibrary && filtered.length === 0 && (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '18px', animation: 'ilm-rise .35s ease' }}>
+            <div style={{ width: '74px', height: '74px', borderRadius: '18px', border: `1px solid ${LINE}`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: ACCENT, background: 'rgba(255,255,255,0.02)' }}>{ICONS.library}</div>
+            <div style={{ textAlign: 'center', maxWidth: '380px' }}>
+              <div style={{ fontSize: '21px', fontWeight: 600, letterSpacing: '-0.3px' }}>
+                {tracks.length === 0 ? 'Your shelf is empty' : 'No records match'}
+              </div>
+              <div style={{ color: DIM, fontSize: '13.5px', marginTop: '8px', lineHeight: 1.55 }}>
+                {tracks.length === 0
+                  ? 'Paste a SoundCloud or Spotify link to fetch art, metadata & BPM, then dig through your collection spatially.'
+                  : 'Adjust your search or filters to bring records back to the shelf.'}
+              </div>
+            </div>
+            {tracks.length === 0 && (
+              <button onClick={() => setDownloadOpen(true)} style={{ border: `1px solid ${LINE}`, background: 'transparent', color: INK, cursor: 'pointer', fontFamily: MONO, fontSize: '11px', letterSpacing: '1px', padding: '9px 18px', borderRadius: '9px' }}>
+                + ADD YOUR FIRST RECORD
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* ===== Tool / settings stub views ===== */}
+        {!isLibrary && (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '18px', animation: 'ilm-rise .35s ease', padding: '0 32px' }}>
+            <div style={{ width: '74px', height: '74px', borderRadius: '18px', border: `1px solid ${LINE}`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: ACCENT, background: 'rgba(255,255,255,0.02)' }}>
+              {stub ? stub.icon : ICONS.settings}
+            </div>
+            <div style={{ textAlign: 'center', maxWidth: '420px' }}>
+              <div style={{ fontSize: '21px', fontWeight: 600, letterSpacing: '-0.3px' }}>{stub ? stub.title : 'Settings'}</div>
+              <div style={{ color: DIM, fontSize: '13.5px', marginTop: '8px', lineHeight: 1.55 }}>
+                {stub
+                  ? stub.body
+                  : 'Download quality, audio engine, library paths, and metadata write-back. Local-first — nothing leaves this machine.'}
+              </div>
+            </div>
+            {view === 'settings' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', marginTop: '8px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.5px', textTransform: 'uppercase', color: '#fff', textAlign: 'center' }}>
+                  MADE BY LOVE ILOVEMUSIC ❤️ RIPO
+                </div>
+                <a
+                  href="https://www.instagram.com/cactusdomain/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ fontFamily: MONO, fontSize: '12px', letterSpacing: '1px', textTransform: 'uppercase', padding: '11px 28px', border: `1px solid ${ACCENT}`, background: ACCENT_SOFT, color: ACCENT, textDecoration: 'none', borderRadius: '9px' }}
+                >
+                  @CACTUSDOMAIN
+                </a>
+                <div style={{ fontFamily: MONO, fontSize: '9.5px', letterSpacing: '1.5px', color: FAINT, marginTop: '4px' }}>
+                  ILOVEMUSIC · LOCAL · v3.0
+                </div>
+              </div>
+            )}
+            <button onClick={() => setView('library')} style={{ border: `1px solid ${LINE}`, background: 'transparent', color: INK, cursor: 'pointer', fontFamily: MONO, fontSize: '11px', letterSpacing: '1px', padding: '9px 18px', borderRadius: '9px' }}>
+              ← BACK TO SHELF
+            </button>
+          </div>
+        )}
+      </main>
+
+      {/* ===================== RIGHT INSPECTOR ===================== */}
+      <aside style={{ display: 'flex', flexDirection: 'column', background: PANEL, borderLeft: `1px solid ${LINE}`, overflowY: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', padding: '18px 22px 14px' }}>
+          <div style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '1.6px', color: FAINT }}>INSPECTOR</div>
+          {focused && (
+            <button
+              onClick={() => setEditing(e => !e)}
+              style={{ marginLeft: 'auto', border: `1px solid ${LINE}`, background: editing ? ACCENT : 'transparent', color: editing ? '#1a1407' : DIM, cursor: 'pointer', fontFamily: MONO, fontSize: '10px', letterSpacing: '1px', padding: '5px 11px', borderRadius: '7px' }}
+            >
+              {editing ? 'DONE' : 'EDIT'}
+            </button>
+          )}
+        </div>
+
+        {!focused ? (
+          <div style={{ padding: '40px 22px', color: DIM, fontSize: '13px', textAlign: 'center', lineHeight: 1.6 }}>
+            Pull a record from the shelf to inspect its metadata.
+          </div>
+        ) : (
+          <div style={{ padding: '0 22px 22px' }}>
+            <div style={{ borderRadius: '13px', overflow: 'hidden', aspectRatio: '1 / 1', background: focusedColor.frame, border: `1px solid ${LINE}`, boxShadow: '0 16px 36px rgba(0,0,0,0.45)', position: 'relative' }}>
+              {focused.artwork ? (
+                <img src={focused.artwork} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+              ) : (
+                <ArtPlaceholder radius={0} label="drop album art" />
+              )}
+            </div>
+
+            {editing ? (
+              <div style={{ marginTop: '18px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <input value={focused.title || ''} onChange={(e) => updateTrackField(focused.id, 'title', e.target.value)} style={{ ...fieldStyle, fontFamily: 'inherit', fontSize: '15px', fontWeight: 600, border: `1px solid ${ACCENT}` }} />
+                <input value={focused.artist || ''} onChange={(e) => updateTrackField(focused.id, 'artist', e.target.value)} style={{ ...fieldStyle, fontFamily: 'inherit', fontSize: '13px', color: DIM }} />
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input value={focused.bpm || ''} onChange={(e) => updateTrackField(focused.id, 'bpm', e.target.value)} placeholder="BPM" style={{ ...fieldStyle, width: '50%' }} />
+                  <input value={focused.key || ''} onChange={(e) => updateTrackField(focused.id, 'key', e.target.value)} placeholder="KEY" style={{ ...fieldStyle, width: '50%' }} />
+                </div>
+                <input value={focused.genre || ''} onChange={(e) => updateTrackField(focused.id, 'genre', e.target.value)} placeholder="Genre" style={{ ...fieldStyle, fontFamily: 'inherit', fontSize: '13px' }} />
+              </div>
+            ) : (
+              <div style={{ marginTop: '18px' }}>
+                <div style={{ fontSize: '21px', fontWeight: 700, letterSpacing: '-0.4px', lineHeight: 1.15 }}>{focused.title}</div>
+                <div style={{ fontSize: '14px', color: DIM, marginTop: '4px' }}>{focused.artist}</div>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: '12px', marginTop: '18px', alignItems: 'stretch' }}>
+              <div style={statCardStyle('rgba(230,178,76,0.07)', 'rgba(230,178,76,0.18)')}>
+                <div style={{ fontFamily: MONO, fontSize: '9px', letterSpacing: '1px', color: ACCENT, opacity: 0.8 }}>BPM</div>
+                <div style={{ ...statValueStyle, color: ACCENT }}>{focused.bpm || '—'}</div>
+              </div>
+              <div style={statCardStyle('rgba(255,255,255,0.025)', LINE)}>
+                <div style={{ fontFamily: MONO, fontSize: '9px', letterSpacing: '1px', color: DIM }}>KEY</div>
+                <div style={statValueStyle}>{focused.key || '—'}</div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: '18px', borderTop: `1px solid ${LINE}` }}>
+              {metaRows.map(r => (
+                <div key={r.k} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '11px 0', borderBottom: `1px solid ${LINE}` }}>
+                  <span style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '1px', color: FAINT }}>{r.k}</span>
+                  <span style={{ fontFamily: MONO, fontSize: '12px', color: INK }}>{r.v}</span>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', marginTop: '18px' }}>
+              <button
+                onClick={() => toggleSelect(focused.id)}
+                style={{ flex: 1, border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: '12.5px', padding: '10px', borderRadius: '9px', background: isFocusedSelected ? ACCENT : 'rgba(255,255,255,0.05)', color: isFocusedSelected ? '#1a1407' : INK }}
+              >
+                {isFocusedSelected ? 'In Crate ✓' : 'Add to Crate'}
+              </button>
+              <button
+                onClick={handleDownload}
+                disabled={selected.size === 0 || downloading}
+                title={selected.size === 0 ? 'Add tracks to the crate first' : 'Download selected as ZIP'}
+                style={{ flex: 'none', border: `1px solid ${LINE}`, cursor: selected.size === 0 || downloading ? 'not-allowed' : 'pointer', padding: '10px 13px', borderRadius: '9px', background: 'transparent', color: selected.size === 0 ? FAINT : DIM, fontFamily: MONO, fontSize: '11px', opacity: downloading ? 0.6 : 1 }}
+              >
+                ⇪ ZIP
+              </button>
+            </div>
+
+            <button
+              onClick={() => handleRemoveTrack(focused.id)}
+              style={{ width: '100%', marginTop: '10px', border: '1px solid rgba(255,80,80,0.2)', background: 'transparent', color: '#e87a7a', cursor: 'pointer', fontFamily: MONO, fontSize: '10.5px', letterSpacing: '1px', padding: '9px', borderRadius: '9px', textTransform: 'uppercase' }}
+            >
+              ✕ Remove from library
+            </button>
+          </div>
+        )}
+      </aside>
+
+      {/* ===================== DOWNLOAD MODAL ===================== */}
+      {downloadOpen && (
+        <div
+          onClick={() => setDownloadOpen(false)}
+          style={{ position: 'fixed', inset: 0, zIndex: 80, background: 'rgba(4,4,5,0.7)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'ilm-rise .25s ease' }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: '560px', maxWidth: '92vw', maxHeight: '88vh', overflowY: 'auto', background: '#0f0f12', border: `1px solid ${LINE}`, borderRadius: '18px', boxShadow: '0 30px 80px rgba(0,0,0,0.7)' }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', padding: '20px 24px', borderBottom: `1px solid ${LINE}` }}>
+              <div>
+                <div style={{ fontSize: '17px', fontWeight: 600 }}>New Download</div>
+                <div style={{ fontFamily: MONO, fontSize: '10px', color: FAINT, letterSpacing: '1px', marginTop: '3px' }}>
+                  PASTE A LINK · WE FETCH ART, METADATA &amp; BPM
+                </div>
+              </div>
+              <button onClick={() => setDownloadOpen(false)} style={{ marginLeft: 'auto', border: 'none', background: 'rgba(255,255,255,0.05)', color: DIM, width: '30px', height: '30px', borderRadius: '8px', cursor: 'pointer', fontSize: '15px' }}>✕</button>
+            </div>
+            <div style={{ padding: '22px 24px' }}>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+                {[['soundcloud', 'SoundCloud'], ['spotify', 'Spotify'], ['bandcamp', 'Bandcamp']].map(([src, label]) => {
+                  const on = dlSource === src;
+                  return (
+                    <button
+                      key={src}
+                      onClick={() => setDlSource(src)}
+                      style={{ flex: 1, border: `1px solid ${on ? ACCENT : LINE}`, background: on ? ACCENT_SOFT : 'rgba(255,255,255,0.02)', color: on ? '#f0d49a' : DIM, cursor: 'pointer', padding: '10px', borderRadius: '10px', fontFamily: 'inherit', fontSize: '13px', fontWeight: 500 }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <input
+                  value={pastedUrl}
+                  onChange={(e) => {
+                    const url = e.target.value;
+                    setPastedUrl(url);
+                    const detected = detectSource(url);
+                    if (detected) setDlSource(detected);
+                  }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddSoundCloud(); }}
+                  disabled={loadingTrack}
+                  placeholder={
+                    dlSource === 'soundcloud'
+                      ? 'https://soundcloud.com/artist/track'
+                      : dlSource === 'spotify'
+                        ? 'https://open.spotify.com/track/…'
+                        : 'https://artist.bandcamp.com/track/…'
+                  }
+                  style={{ ...fieldStyle, flex: 1, borderRadius: '10px', padding: '11px 13px' }}
+                />
+                <button
+                  onClick={handleAddSoundCloud}
+                  disabled={loadingTrack}
+                  style={{ border: 'none', cursor: loadingTrack ? 'wait' : 'pointer', background: ACCENT, color: '#1a1407', fontFamily: 'inherit', fontSize: '13px', fontWeight: 600, padding: '0 18px', borderRadius: '10px', opacity: loadingTrack ? 0.6 : 1 }}
+                >
+                  {loadingTrack ? '…' : 'Fetch'}
+                </button>
+              </div>
+
+              {loadingTrack && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '22px', color: DIM, fontFamily: MONO, fontSize: '12px' }}>
+                  <span style={{ width: '16px', height: '16px', border: `2px solid ${LINE}`, borderTopColor: ACCENT, borderRadius: '50%', display: 'inline-block', animation: 'ilm-spin .7s linear infinite' }} />
+                  Fetching track · detecting BPM…
+                </div>
+              )}
+
+              <div style={{ marginTop: '22px' }}>
+                <div style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '1.5px', color: FAINT, marginBottom: '10px' }}>
+                  {downloading ? 'EXPORTING SELECTION' : `CRATE · ${selected.size} SELECTED`}
+                </div>
+                {downloading ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 0', borderTop: `1px solid ${LINE}` }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: '12.5px' }}>Building ZIP…</div>
+                      <div style={{ height: '3px', borderRadius: '3px', background: 'rgba(255,255,255,0.07)', marginTop: '6px', overflow: 'hidden' }}>
+                        <div style={{ height: '100%', background: ACCENT, width: `${downloadProgress}%`, transition: 'width 0.3s ease-out' }} />
+                      </div>
+                    </div>
+                    <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, flex: 'none' }}>{downloadProgress}%</span>
+                  </div>
+                ) : (
+                  <div style={{ fontFamily: MONO, fontSize: '11px', color: DIM, lineHeight: 1.6 }}>
+                    Select records on the shelf, then export the whole crate as a ZIP from here or the inspector.
                   </div>
                 )}
-                <div style={{
-                  fontSize: '11px',
-                  color: '#1a1a1a',
-                  marginBottom: '6px',
-                  textTransform: 'uppercase'
-                }}>
-                  {formatTime(track.currentTime)} / {formatTime(track.duration)}
-                </div>
-                <div 
-                  onClick={(e) => handleProgressClick(e, track)}
-                  onMouseDown={(e) => handleProgressMouseDown(e, track)}
-                  style={{
-                    height: '2px',
-                    backgroundColor: '#999',
-                    position: 'relative',
-                    maxWidth: '100%',
-                    cursor: 'pointer'
-                  }}
-                >
-                  <div style={{
-                    position: 'absolute',
-                    left: 0,
-                    top: 0,
-                    height: '100%',
-                    width: `${progress * 100}%`,
-                    backgroundColor: '#1a1a1a',
-                    transition: 'width 0.1s linear'
-                  }} />
-                </div>
               </div>
-
-              <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
-                <button
-                  onClick={() => toggleSelect(track.id)}
-                  style={{
-                    width: '32px',
-                    height: '32px',
-                    border: isSelected ? 'none' : '1px solid #1a1a1a',
-                    backgroundColor: isSelected ? '#1a1a1a' : '#fff',
-                    color: isSelected ? '#fff' : '#1a1a1a',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '18px',
-                    fontWeight: 'normal',
-                    transition: 'all 0.2s ease-out',
-                    outline: 'none'
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isSelected) {
-                      e.target.style.backgroundColor = '#1a1a1a';
-                      e.target.style.color = '#fff';
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isSelected) {
-                      e.target.style.backgroundColor = '#fff';
-                      e.target.style.color = '#1a1a1a';
-                    }
-                  }}
-                  title="SELECT/DESELECT"
-                >
-                  {isSelected ? '−' : '+'}
-                </button>
-                <button
-                  onClick={() => handleEditTrack(track)}
-                  style={{
-                    width: '32px',
-                    height: '32px',
-                    border: '1px solid #1a1a1a',
-                    backgroundColor: '#fff',
-                    color: '#1a1a1a',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '12px',
-                    transition: 'all 0.2s ease-out'
-                  }}
-                  onMouseEnter={(e) => {
-                    e.target.style.backgroundColor = '#1a1a1a';
-                    e.target.style.color = '#fff';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.target.style.backgroundColor = '#fff';
-                    e.target.style.color = '#1a1a1a';
-                  }}
-                  title="EDIT METADATA"
-                >
-                  ✎
-                </button>
-                <button
-                  onClick={() => handleRemoveTrack(track.id)}
-                  style={{
-                    width: '32px',
-                    height: '32px',
-                    border: '1px solid #1a1a1a',
-                    backgroundColor: '#fff',
-                    color: '#1a1a1a',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '16px',
-                    fontWeight: 'bold',
-                    transition: 'all 0.2s ease-out'
-                  }}
-                  onMouseEnter={(e) => {
-                    e.target.style.backgroundColor = '#1a1a1a';
-                    e.target.style.color = '#fff';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.target.style.backgroundColor = '#fff';
-                    e.target.style.color = '#1a1a1a';
-                  }}
-                  title="REMOVE TRACK"
-                >
-                  ×
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      )}
-
-      {/* Edit Track Modal */}
-      {editingTrack && (
-        <div style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          backgroundColor: 'rgba(0, 0, 0, 0.5)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 1000
-        }}
-        onClick={() => setEditingTrack(null)}
-        >
-          <div style={{
-            backgroundColor: '#fff',
-            padding: '32px',
-            maxWidth: '600px',
-            width: '90%',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '24px',
-            boxShadow: '0 4px 20px rgba(0, 0, 0, 0.3)'
-          }}
-          onClick={(e) => e.stopPropagation()}
-          >
-            <h2 style={{ 
-              fontSize: '12px', 
-              textTransform: 'uppercase', 
-              margin: 0,
-              letterSpacing: '0.02em',
-              fontWeight: '600'
-            }}>
-              EDIT TRACK METADATA
-            </h2>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              <div>
-                <label style={{ 
-                  fontSize: '11px', 
-                  textTransform: 'uppercase', 
-                  display: 'block', 
-                  marginBottom: '8px',
-                  fontWeight: '600',
-                  letterSpacing: '0.01em'
-                }}>
-                  TITLE
-                </label>
-                <input
-                  type="text"
-                  defaultValue={editingTrack.title}
-                  id="edit-title"
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: '1px solid #1a1a1a',
-                    fontSize: '11px',
-                    textTransform: 'uppercase',
-                    outline: 'none',
-                    fontFamily: 'inherit',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
-              <div>
-                <label style={{ 
-                  fontSize: '11px', 
-                  textTransform: 'uppercase', 
-                  display: 'block', 
-                  marginBottom: '8px',
-                  fontWeight: '600',
-                  letterSpacing: '0.01em'
-                }}>
-                  ARTIST
-                </label>
-                <input
-                  type="text"
-                  defaultValue={editingTrack.artist}
-                  id="edit-artist"
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: '1px solid #1a1a1a',
-                    fontSize: '11px',
-                    textTransform: 'uppercase',
-                    outline: 'none',
-                    fontFamily: 'inherit',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end', marginTop: '8px' }}>
-              <button
-                onClick={() => setEditingTrack(null)}
-                style={{
-                  padding: '10px 24px',
-                  border: '1px solid #1a1a1a',
-                  backgroundColor: '#fff',
-                  color: '#1a1a1a',
-                  cursor: 'pointer',
-                  fontSize: '11px',
-                  textTransform: 'uppercase',
-                  fontFamily: 'inherit',
-                  letterSpacing: '0.02em',
-                  transition: 'all 0.2s ease-out'
-                }}
-                onMouseEnter={(e) => {
-                  e.target.style.backgroundColor = '#1a1a1a';
-                  e.target.style.color = '#fff';
-                }}
-                onMouseLeave={(e) => {
-                  e.target.style.backgroundColor = '#fff';
-                  e.target.style.color = '#1a1a1a';
-                }}
-              >
-                CANCEL
-              </button>
-              <button
-                onClick={() => {
-                  const updated = {
-                    ...editingTrack,
-                    title: document.getElementById('edit-title').value,
-                    artist: document.getElementById('edit-artist').value
-                  };
-                  handleSaveEdit(updated);
-                }}
-                style={{
-                  padding: '10px 24px',
-                  border: 'none',
-                  backgroundColor: '#1a1a1a',
-                  color: '#fff',
-                  cursor: 'pointer',
-                  fontSize: '11px',
-                  textTransform: 'uppercase',
-                  fontFamily: 'inherit',
-                  letterSpacing: '0.02em',
-                  transition: 'all 0.2s ease-out'
-                }}
-                onMouseEnter={(e) => {
-                  e.target.style.opacity = '0.8';
-                }}
-                onMouseLeave={(e) => {
-                  e.target.style.opacity = '1';
-                }}
-              >
-                SAVE
-              </button>
             </div>
           </div>
         </div>
       )}
-      </div>
 
+      {/* ===================== FLOATING DOWNLOAD BAR (selected) ===================== */}
       {selected.size > 0 && (
-        <div style={{
-          position: 'fixed',
-          bottom: '32px',
-          left: '50%',
-          transform: 'translateX(-50%)',
-          maxWidth: '840px',
-          width: 'calc(100% - 64px)',
-          padding: '14px 20px',
-          backgroundColor: '#1a1a1a',
-          color: '#fff',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '12px',
-          fontSize: '11px',
-          letterSpacing: '0.02em',
-          textTransform: 'uppercase',
-          boxShadow: '0 4px 12px #1a1a1a',
-          transition: 'opacity 0.2s ease-out',
-          borderRadius: 0
-        }}>
+        <div
+          style={{
+            position: 'fixed',
+            bottom: '24px',
+            left: 'calc((100vw - 338px) / 2)',
+            transform: 'translateX(-50%)',
+            maxWidth: '560px',
+            width: 'calc(100vw - 338px - 80px)',
+            minWidth: '360px',
+            padding: '14px 20px',
+            background: 'rgba(14,14,17,0.88)',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(230,178,76,0.3)',
+            borderRadius: '14px',
+            color: '#fff',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '12px',
+            fontSize: '11px',
+            letterSpacing: '0.02em',
+            textTransform: 'uppercase',
+            boxShadow: '0 18px 50px rgba(0,0,0,0.5)',
+            zIndex: 60,
+          }}
+        >
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>{selected.size} SELECTED</span>
+            <span style={{ fontFamily: MONO, color: DIM }}>{selected.size} SELECTED</span>
             <button
               onClick={handleDownload}
               disabled={downloading}
-              style={{
-                fontFamily: 'inherit',
-                fontSize: '11px',
-                letterSpacing: '0.02em',
-                textTransform: 'uppercase',
-                padding: '8px 20px',
-                border: '0px solid #fff',
-                backgroundColor: 'transparent',
-                color: '#fff',
-                cursor: downloading ? 'wait' : 'pointer',
-                transition: 'all 0.2s ease-out',
-                opacity: downloading ? 0.6 : 1,
-                borderRadius: 0
-              }}
-              onMouseEnter={(e) => {
-                if (!downloading) {
-                  e.target.style.backgroundColor = '#fff';
-                  e.target.style.color = '#1a1a1a';
-                }
-              }}
-              onMouseLeave={(e) => {
-                e.target.style.backgroundColor = 'transparent';
-                e.target.style.color = '#fff';
-              }}
+              style={{ fontFamily: MONO, fontSize: '11px', letterSpacing: '0.5px', textTransform: 'uppercase', padding: '8px 20px', border: 'none', background: ACCENT, color: '#1a1407', cursor: downloading ? 'wait' : 'pointer', borderRadius: '9px', fontWeight: 600, opacity: downloading ? 0.6 : 1 }}
             >
-              {downloading 
-                ? `DOWNLOADING... ${downloadProgress}%` 
-                : selected.size === 1 
-                  ? 'DOWNLOAD TRACK' 
+              {downloading
+                ? `DOWNLOADING… ${downloadProgress}%`
+                : selected.size === 1
+                  ? 'DOWNLOAD TRACK'
                   : `DOWNLOAD ${selected.size} AS ZIP`}
             </button>
           </div>
           {downloading && (
-            <div style={{
-              width: '100%',
-              height: '4px',
-              backgroundColor: '#333',
-              borderRadius: 0,
-              overflow: 'hidden'
-            }}>
-              <div style={{
-                width: `${downloadProgress}%`,
-                height: '100%',
-                backgroundColor: '#fff',
-                transition: 'width 0.3s ease-out'
-              }}></div>
+            <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', overflow: 'hidden' }}>
+              <div style={{ width: `${downloadProgress}%`, height: '100%', background: 'linear-gradient(90deg, var(--accent), #caa055)', transition: 'width 0.3s ease-out' }} />
             </div>
           )}
         </div>
       )}
-
-      </div>
     </div>
   );
 };
