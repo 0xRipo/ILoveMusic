@@ -1,7 +1,8 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
+const crypto = require('crypto');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
@@ -2687,5 +2688,234 @@ ipcMain.handle('tracks:load', async () => {
     console.error('Error loading tracks:', error);
     // Return empty array on error instead of failing
     return { success: true, tracks: [] };
+  }
+});
+
+// ===========================================================================
+// ALBUM / PLAYLIST SUPPORT (Phase 1: SoundCloud sets + Bandcamp albums)
+// ===========================================================================
+
+// Scan a downloaded album folder and build full track objects (same shape as
+// single-track downloads). Title/artist/duration/artwork come from embedded
+// ID3 via music-metadata (ESM → dynamic import). BPM/key are left null for now.
+async function buildAlbumTracksFromFolder(dir, source) {
+  const mm = await import('music-metadata');
+  const exts = ['.mp3', '.m4a', '.flac', '.wav', '.opus', '.ogg'];
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter(f => exts.includes(path.extname(f).toLowerCase()));
+  } catch {
+    return [];
+  }
+  files.sort();
+  const tracks = [];
+  const base = Date.now();
+  for (let i = 0; i < files.length; i++) {
+    const filePath = path.resolve(path.join(dir, files[i]));
+    let title = path.basename(files[i], path.extname(files[i]));
+    let artist = 'Unknown Artist';
+    let duration = 0;
+    let artwork = null;
+    try {
+      const md = await mm.parseFile(filePath, { skipCovers: false });
+      if (md.common.title) title = md.common.title;
+      if (md.common.artist) artist = md.common.artist;
+      if (md.format.duration) duration = md.format.duration;
+      const cover = mm.selectCover ? mm.selectCover(md.common.picture) : (md.common.picture && md.common.picture[0]);
+      if (cover) artwork = `data:${cover.format};base64,${Buffer.from(cover.data).toString('base64')}`;
+    } catch (e) {
+      /* keep filename-derived defaults */
+    }
+    tracks.push({
+      id: base * 1000 + i, // numeric, collision-safe, compatible with handlePlay
+      title,
+      artist,
+      duration,
+      currentTime: 0,
+      url: `file://${filePath}`,
+      filePath,
+      bpm: null,
+      key: null,
+      artwork,
+      source,
+    });
+  }
+  return tracks;
+}
+
+// SoundCloud sets / Bandcamp albums — yt-dlp handles these natively as playlists.
+ipcMain.handle('download-sc-bandcamp-album', async (event, { url, source } = {}) => {
+  try {
+    if (!url) throw new Error('No album URL provided');
+    const ytDlpPath = getYtDlpPath();
+    const albumId = crypto.createHash('md5').update(url).digest('hex').slice(0, 16);
+    const outputDir = path.join(app.getPath('userData'), 'tracks', 'albums', albumId);
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    // Playlist metadata first (fast, flat) so the card can appear immediately.
+    let info = {};
+    try {
+      const { stdout } = await execFileAsync(ytDlpPath, ['--dump-single-json', '--flat-playlist', url]);
+      info = JSON.parse(stdout);
+    } catch (e) {
+      console.warn('Album metadata fetch failed:', e.message);
+    }
+    const entries = Array.isArray(info.entries) ? info.entries : [];
+    const albumMeta = {
+      id: albumId,
+      title: info.title || 'Unknown Album',
+      artist: info.uploader || info.channel || 'Unknown Artist',
+      artwork: info.thumbnail || null,
+      source,
+      dateAdded: new Date().toISOString(),
+      trackCount: entries.length || null,
+      tracks: [],
+    };
+    event.sender.send('album-meta-ready', albumMeta);
+
+    // Download the whole playlist.
+    await new Promise((resolve, reject) => {
+      const args = [
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', '0',
+        '--embed-thumbnail',
+        '--embed-metadata',
+        '-o', path.join(outputDir, '%(playlist_index)s - %(title)s.%(ext)s'),
+        '--newline',
+        url,
+      ];
+      const proc = spawn(ytDlpPath, args);
+      proc.stdout.on('data', (d) => {
+        event.sender.send('album-download-progress', { albumId, log: d.toString() });
+      });
+      proc.stderr.on('data', () => {});
+      proc.on('close', () => resolve());
+      proc.on('error', reject);
+    });
+
+    // Build real track objects from the downloaded files.
+    const tracks = await buildAlbumTracksFromFolder(outputDir, source);
+    const artwork = albumMeta.artwork || (tracks.find(t => t.artwork) || {}).artwork || null;
+    event.sender.send('album-tracks-ready', { albumId, tracks, artwork });
+
+    return { success: true, albumId, count: tracks.length };
+  } catch (e) {
+    console.error('Album download failed:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+// Spotify albums — Spotify hosts no downloadable audio, so we fetch the album
+// track list from the API, then download each track via a yt-dlp YouTube search
+// (same mechanism as the single Spotify-track flow). Per-track progress is exact
+// because we download sequentially.
+ipcMain.handle('download-spotify-album', async (event, albumUrl) => {
+  try {
+    if (!albumUrl) throw new Error('No album URL provided');
+    const token = await getSpotifyToken();
+    if (!token) throw new Error('Spotify credentials not configured (.env)');
+    const auth = { Authorization: `Bearer ${token}` };
+
+    const albumId = (albumUrl.split('/album/')[1] || '').split('?')[0];
+    if (!albumId) throw new Error('Invalid Spotify album URL');
+
+    const ytDlpPath = getYtDlpPath();
+    const outputDir = path.join(app.getPath('userData'), 'tracks', 'albums', albumId);
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    // Album metadata.
+    const albumRes = await fetch(`https://api.spotify.com/v1/albums/${albumId}`, { headers: auth });
+    if (!albumRes.ok) throw new Error(`Failed to fetch album (${albumRes.status})`);
+    const albumData = await albumRes.json();
+    const albumArtist = albumData.artists?.[0]?.name || 'Unknown Artist';
+    const albumMeta = {
+      id: albumId,
+      title: albumData.name || 'Unknown Album',
+      artist: albumArtist,
+      artwork: albumData.images?.[0]?.url || null,
+      source: 'spotify',
+      dateAdded: new Date().toISOString(),
+      trackCount: albumData.total_tracks || null,
+      tracks: [],
+    };
+    event.sender.send('album-meta-ready', albumMeta);
+
+    // All track stubs (handle pagination).
+    let tracksUrl = `https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`;
+    const allTracks = [];
+    while (tracksUrl) {
+      const r = await fetch(tracksUrl, { headers: auth });
+      if (!r.ok) break;
+      const d = await r.json();
+      if (Array.isArray(d.items)) allTracks.push(...d.items);
+      tracksUrl = d.next;
+    }
+    const total = allTracks.length;
+
+    // Download each track via YouTube search, sequentially, with exact progress.
+    for (let i = 0; i < total; i++) {
+      const t = allTracks[i];
+      const trackArtist = t.artists?.[0]?.name || albumArtist;
+      const searchQuery = `${trackArtist} ${t.name}`;
+      event.sender.send('album-download-progress', {
+        albumId,
+        current: i + 1,
+        total,
+        trackTitle: t.name,
+        done: false,
+      });
+      try {
+        const args = [
+          `ytsearch1:${searchQuery}`,
+          '-x',
+          '--audio-format', 'mp3',
+          '--audio-quality', '0',
+          '--embed-thumbnail',
+          '--embed-metadata',
+          '-o', path.join(outputDir, `${String(i + 1).padStart(2, '0')} - %(title)s.%(ext)s`),
+        ];
+        await execFileAsync(ytDlpPath, args, { timeout: 180000 });
+      } catch (err) {
+        console.warn(`Spotify album track failed (${t.name}):`, err.message);
+      }
+    }
+
+    // Build real track objects from the downloaded files.
+    const tracks = await buildAlbumTracksFromFolder(outputDir, 'spotify');
+    const artwork = albumMeta.artwork || (tracks.find(t => t.artwork) || {}).artwork || null;
+    event.sender.send('album-tracks-ready', { albumId, tracks, artwork });
+
+    return { success: true, albumId, count: tracks.length };
+  } catch (e) {
+    console.error('Spotify album download failed:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+// Persist albums (mirror of tracks:save / tracks:load).
+ipcMain.handle('albums:save', async (_, albums) => {
+  try {
+    const userDataPath = app.getPath('userData');
+    const albumsFilePath = path.join(userDataPath, 'albums.json');
+    if (!fs.existsSync(userDataPath)) fs.mkdirSync(userDataPath, { recursive: true });
+    fs.writeFileSync(albumsFilePath, JSON.stringify(albums, null, 2), 'utf8');
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving albums:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('albums:load', async () => {
+  try {
+    const userDataPath = app.getPath('userData');
+    const albumsFilePath = path.join(userDataPath, 'albums.json');
+    if (!fs.existsSync(albumsFilePath)) return { success: true, albums: [] };
+    const albums = JSON.parse(fs.readFileSync(albumsFilePath, 'utf8'));
+    return { success: true, albums };
+  } catch (error) {
+    console.error('Error loading albums:', error);
+    return { success: true, albums: [] };
   }
 });

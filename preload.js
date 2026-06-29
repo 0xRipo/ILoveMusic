@@ -6,6 +6,14 @@ contextBridge.exposeInMainWorld('electron', {
   exportRekordbox: (tracks) => ipcRenderer.invoke('exportRekordbox', tracks),
   saveTracks: (tracks) => ipcRenderer.invoke('tracks:save', tracks),
   loadTracks: () => ipcRenderer.invoke('tracks:load'),
+  // Albums / playlists (Phase 1: SoundCloud + Bandcamp)
+  downloadScBandcampAlbum: (payload) => ipcRenderer.invoke('download-sc-bandcamp-album', payload),
+  downloadSpotifyAlbum: (url) => ipcRenderer.invoke('download-spotify-album', url),
+  saveAlbums: (albums) => ipcRenderer.invoke('albums:save', albums),
+  loadAlbums: () => ipcRenderer.invoke('albums:load'),
+  onAlbumMetaReady: (cb) => ipcRenderer.on('album-meta-ready', (_, data) => cb(data)),
+  onAlbumDownloadProgress: (cb) => ipcRenderer.on('album-download-progress', (_, data) => cb(data)),
+  onAlbumTracksReady: (cb) => ipcRenderer.on('album-tracks-ready', (_, data) => cb(data)),
   enrichTrackMetadata: (filePath) =>
     ipcRenderer.invoke('enrich-track-metadata', filePath),
   extractArtwork: (filePath) =>

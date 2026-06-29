@@ -54,6 +54,21 @@ const detectSource = (url) => {
   return null;
 };
 
+// Classify a URL as a single track vs. an album/playlist. SoundCloud sets are
+// detected via `/sets/` (NOT path-segment count, which misfires on normal
+// track URLs). Returns { source, type } or null.
+const detectUrlType = (url) => {
+  if (!url) return null;
+  const u = url.toLowerCase();
+  if (u.includes('spotify.com/album/')) return { source: 'spotify', type: 'album' };
+  if (u.includes('spotify.com/track/')) return { source: 'spotify', type: 'track' };
+  if (u.includes('soundcloud.com/') && u.includes('/sets/')) return { source: 'soundcloud', type: 'playlist' };
+  if (u.includes('soundcloud.com/')) return { source: 'soundcloud', type: 'track' };
+  if (u.includes('bandcamp.com/album/')) return { source: 'bandcamp', type: 'album' };
+  if (u.includes('bandcamp.com/track/')) return { source: 'bandcamp', type: 'track' };
+  return null;
+};
+
 // Source values are stored lowercase ('soundcloud' | 'spotify' | 'bandcamp').
 // Normalize to display label / short badge, tolerating legacy/capitalized values.
 const SOURCE_LABEL = { soundcloud: 'SoundCloud', spotify: 'Spotify', bandcamp: 'Bandcamp' };
@@ -240,6 +255,13 @@ const ILoveMusic = () => {
   const audioRefs = useRef({});
   const downloadProgressRef = useRef(0);
 
+  /* ===== Albums / playlists (Phase 1) ===== */
+  const [albums, setAlbums] = useState([]); // album cards; album.tracks live inside, never in `tracks`
+  const [albumsLoaded, setAlbumsLoaded] = useState(false);
+  const [openAlbum, setOpenAlbum] = useState(null); // album whose inner shelf is open
+  const [albumProgress, setAlbumProgress] = useState({}); // { [albumId]: { ...progress, done } }
+  const [albumTimes, setAlbumTimes] = useState({}); // { [trackId]: { currentTime, duration } } for inner shelf
+
   /* ===== New UI-only state (spatial shell) ===== */
   const [view, setView] = useState('library'); // library | playlists | collections | bpm | settings
   const [selectedIndex, setSelectedIndex] = useState(0); // focused card (inspector / now-playing)
@@ -318,6 +340,62 @@ const ILoveMusic = () => {
     saveTracks();
   }, [tracks, tracksLoaded]);
 
+  // Load albums on mount.
+  useEffect(() => {
+    const load = async () => {
+      try {
+        if (window.electron && window.electron.loadAlbums) {
+          const result = await window.electron.loadAlbums();
+          if (result.success && result.albums) setAlbums(result.albums);
+        }
+      } catch (err) {
+        console.error('Error loading albums:', err);
+      } finally {
+        setAlbumsLoaded(true);
+      }
+    };
+    load();
+  }, []);
+
+  // Persist albums on change. Drop album-level base64 artwork to keep the file
+  // small (URL artwork is kept; track-level art inside album.tracks is retained).
+  useEffect(() => {
+    if (!albumsLoaded) return;
+    if (!window.electron || !window.electron.saveAlbums) return;
+    const toSave = albums.map(a => ({
+      ...a,
+      artwork: a.artwork && String(a.artwork).startsWith('data:') ? null : a.artwork,
+    }));
+    window.electron.saveAlbums(toSave);
+  }, [albums, albumsLoaded]);
+
+  // Album download IPC listeners (registered once for the app lifetime).
+  useEffect(() => {
+    if (!window.electron) return;
+    if (window.electron.onAlbumMetaReady) {
+      window.electron.onAlbumMetaReady((meta) => {
+        setAlbums(prev => (prev.some(a => a.id === meta.id) ? prev : [...prev, meta]));
+      });
+    }
+    if (window.electron.onAlbumDownloadProgress) {
+      window.electron.onAlbumDownloadProgress((p) => {
+        setAlbumProgress(prev => ({ ...prev, [p.albumId]: { ...prev[p.albumId], ...p } }));
+      });
+    }
+    if (window.electron.onAlbumTracksReady) {
+      window.electron.onAlbumTracksReady(({ albumId, tracks: albumTracks, artwork }) => {
+        setAlbums(prev =>
+          prev.map(a =>
+            a.id === albumId
+              ? { ...a, tracks: albumTracks, trackCount: albumTracks.length, artwork: a.artwork || artwork }
+              : a
+          )
+        );
+        setAlbumProgress(prev => ({ ...prev, [albumId]: { ...prev[albumId], done: true } }));
+      });
+    }
+  }, []);
+
   // Enrich a freshly-added track with format / file size / date added / key /
   // artwork, plus a Spotify BPM+key lookup (Layer 1). All resolve, then a single
   // merge avoids races: Spotify upgrades BPM/key when available; otherwise the
@@ -365,8 +443,43 @@ const ILoveMusic = () => {
     }
   };
 
+  // Album/playlist downloads run in the background: the card appears via the
+  // album-meta-ready listener and fills in when album-tracks-ready arrives.
+  const handleAlbumDownload = (urlType) => {
+    const url = pastedUrl;
+    const onResult = (result) => {
+      if (!result || !result.success) {
+        alert('Album download failed: ' + ((result && result.error) || 'unknown error'));
+      }
+    };
+    const onErr = (err) => alert('Album download failed: ' + (err.message || 'unknown error'));
+
+    if (urlType.source === 'spotify') {
+      if (!window.electron || !window.electron.downloadSpotifyAlbum) {
+        alert('Spotify album download is not available in this build.');
+        return;
+      }
+      window.electron.downloadSpotifyAlbum(url).then(onResult).catch(onErr);
+    } else {
+      if (!window.electron || !window.electron.downloadScBandcampAlbum) {
+        alert('Album download is not available in this build.');
+        return;
+      }
+      window.electron.downloadScBandcampAlbum({ url, source: urlType.source }).then(onResult).catch(onErr);
+    }
+    setPastedUrl('');
+    setDownloadOpen(false);
+  };
+
   const handleAddSoundCloud = async () => {
     if (!pastedUrl.trim() || loadingTrack) return;
+
+    // Album / playlist URL → dedicated album flow (single tracks fall through).
+    const urlType = detectUrlType(pastedUrl);
+    if (urlType && (urlType.type === 'album' || urlType.type === 'playlist')) {
+      handleAlbumDownload(urlType);
+      return;
+    }
 
     // Check if electron API is available
     if (!window.electron || !window.electron.addSoundCloud) {
@@ -743,10 +856,22 @@ const ILoveMusic = () => {
 
   /* ===== Derived view data ===== */
   const filtered = getFilteredAndSortedTracks();
-  const focusIdx = filtered.length ? clamp(0, filtered.length - 1, selectedIndex) : -1;
-  const focused = focusIdx >= 0 ? filtered[focusIdx] : null;
+  // Main shelf = album cards + standalone tracks, newest first. Album tracks
+  // live inside album.tracks and never enter `tracks`/`filtered`.
+  const shelfItems = [
+    ...albums.map(a => ({ ...a, _type: 'album' })),
+    ...filtered.map(t => ({ ...t, _type: 'track' })),
+  ].sort((a, b) => {
+    const da = a.dateAdded ? new Date(a.dateAdded).getTime() : 0;
+    const db = b.dateAdded ? new Date(b.dateAdded).getTime() : 0;
+    return db - da;
+  });
+  const focusIdx = shelfItems.length ? clamp(0, shelfItems.length - 1, selectedIndex) : -1;
+  const focused = focusIdx >= 0 ? shelfItems[focusIdx] : null;
+  const focusedTrack = focused && focused._type !== 'album' ? focused : null;
+  const focusedAlbum = focused && focused._type === 'album' ? focused : null;
   const isLibrary = view === 'library';
-  const shelfVisible = isLibrary && filtered.length > 0;
+  const shelfVisible = isLibrary && shelfItems.length > 0;
 
   const focusTo = (i) => {
     // Animate to the target: nudge targetRef only and let the rAF loop ease
@@ -757,9 +882,10 @@ const ILoveMusic = () => {
 
   // Keep rAF-loop refs in sync with the latest render (read inside the loop).
   useEffect(() => {
-    filteredLenRef.current = filtered.length;
+    filteredLenRef.current = shelfItems.length;
     actionsRef.current.togglePlayFocused = () => {
-      if (focused) handlePlay(focused.id);
+      if (focusedTrack) handlePlay(focusedTrack.id);
+      else if (focusedAlbum) setOpenAlbum(focusedAlbum);
     };
   });
 
@@ -768,11 +894,11 @@ const ILoveMusic = () => {
      embedded cover once. Keyed on the focused id so it runs once per track and
      never loops once artwork is set. */
   useEffect(() => {
-    if (!focused || focused.artwork) return undefined;
-    const filePath = focused.filePath || focused.path;
+    if (!focusedTrack || focusedTrack.artwork) return undefined;
+    const filePath = focusedTrack.filePath || focusedTrack.path;
     if (!filePath || !window.electron || !window.electron.extractArtwork) return undefined;
     let cancelled = false;
-    const fid = focused.id;
+    const fid = focusedTrack.id;
     window.electron
       .extractArtwork(filePath)
       .then(result => {
@@ -784,7 +910,7 @@ const ILoveMusic = () => {
     return () => {
       cancelled = true;
     };
-  }, [focused?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [focusedTrack?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // TEMP DIAGNOSTIC — remove once artwork is confirmed. Reveals (a) whether the
   // running app's preload exposes the extractArtwork IPC (undefined ⇒ Electron
@@ -893,10 +1019,10 @@ const ILoveMusic = () => {
 
   /* Now-playing / inspector progress derived from real audio state. */
   const npProgress =
-    focused && focused.duration > 0 ? (focused.currentTime || 0) / focused.duration : 0;
+    focusedTrack && focusedTrack.duration > 0 ? (focusedTrack.currentTime || 0) / focusedTrack.duration : 0;
   const focusedColor = focused ? colorFor(focused.id, focusIdx) : { frame: '#1a1a1d', ink: '#fff' };
-  const isFocusedPlaying = focused && playingTrack === focused.id;
-  const isFocusedSelected = focused && selected.has(focused.id);
+  const isFocusedPlaying = focusedTrack && playingTrack === focusedTrack.id;
+  const isFocusedSelected = focusedTrack && selected.has(focusedTrack.id);
   const waveBars = makeBars((focusIdx >= 0 ? focusIdx : 0) + 1, 58);
 
   const stub = null;
@@ -941,17 +1067,53 @@ const ILoveMusic = () => {
     outline: 'none',
   };
 
-  const metaRows = focused
+  const metaRows = focusedTrack
     ? [
-        { k: 'DURATION', v: formatTime(focused.duration) },
-        { k: 'KEY', v: focused.key || '—' },
-        { k: 'GENRE', v: focused.genre || '—' },
-        { k: 'FILE SIZE', v: focused.fileSize || '—' },
-        { k: 'FORMAT', v: focused.format || '—' },
-        { k: 'SOURCE', v: sourceLabel(focused.source) },
-        { k: 'DATE ADDED', v: focused.dateAdded ? new Date(focused.dateAdded).toLocaleDateString() : '—' },
+        { k: 'DURATION', v: formatTime(focusedTrack.duration) },
+        { k: 'KEY', v: focusedTrack.key || '—' },
+        { k: 'GENRE', v: focusedTrack.genre || '—' },
+        { k: 'FILE SIZE', v: focusedTrack.fileSize || '—' },
+        { k: 'FORMAT', v: focusedTrack.format || '—' },
+        { k: 'SOURCE', v: sourceLabel(focusedTrack.source) },
+        { k: 'DATE ADDED', v: focusedTrack.dateAdded ? new Date(focusedTrack.dateAdded).toLocaleDateString() : '—' },
       ]
     : [];
+
+  // Wire audio progress for the currently-open album's tracks (inner shelf).
+  // Reuses audioRefs/handlePlay/playingTrack; progress lives in albumTimes so
+  // the main `tracks` state is never touched by album playback.
+  useEffect(() => {
+    if (!openAlbum || !openAlbum.tracks) return undefined;
+    const cleanups = [];
+    openAlbum.tracks.forEach(track => {
+      const audio = audioRefs.current[track.id];
+      if (!audio) return;
+      const onMeta = () => setAlbumTimes(prev => ({ ...prev, [track.id]: { ...prev[track.id], duration: audio.duration } }));
+      const onTime = () => setAlbumTimes(prev => ({ ...prev, [track.id]: { ...prev[track.id], currentTime: audio.currentTime } }));
+      const onEnded = () => {
+        setPlayingTrack(null);
+        setAlbumTimes(prev => ({ ...prev, [track.id]: { ...prev[track.id], currentTime: 0 } }));
+      };
+      audio.addEventListener('loadedmetadata', onMeta);
+      audio.addEventListener('timeupdate', onTime);
+      audio.addEventListener('ended', onEnded);
+      cleanups.push(() => {
+        audio.removeEventListener('loadedmetadata', onMeta);
+        audio.removeEventListener('timeupdate', onTime);
+        audio.removeEventListener('ended', onEnded);
+      });
+    });
+    return () => cleanups.forEach(fn => fn());
+  }, [openAlbum]);
+
+  const handleAlbumSeek = (e, track) => {
+    const audio = audioRefs.current[track.id];
+    if (!audio) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const dur = track.duration || (albumTimes[track.id] && albumTimes[track.id].duration) || 0;
+    audio.currentTime = pct * dur;
+  };
 
   return (
     <div
@@ -1137,7 +1299,7 @@ const ILoveMusic = () => {
         )}
 
         {/* ===== Library shelf ===== */}
-        {isLibrary && filtered.length > 0 && (
+        {shelfVisible && (
           <div
             ref={stageRef}
             style={{
@@ -1161,14 +1323,25 @@ const ILoveMusic = () => {
                 isolation: 'isolate',
               }}
             >
-              {filtered.map((t, i) => {
-                const c = colorFor(t.id, i);
+              {shelfItems.map((item, i) => {
+                const isAlbum = item._type === 'album';
+                const c = colorFor(item.id, i);
+                const prog = isAlbum ? albumProgress[item.id] : null;
+                const downloading = isAlbum && prog && !prog.done;
+                const albumCount = item.trackCount || (item.tracks ? item.tracks.length : 0);
+                const dlText = downloading
+                  ? (prog.total ? `DOWNLOADING ${prog.current || 0}/${prog.total}…` : 'DOWNLOADING…')
+                  : null;
                 return (
                   <div
-                    key={t.id}
+                    key={(isAlbum ? 'album-' : 'track-') + item.id}
                     data-card="1"
                     data-index={i}
-                    onClick={() => { triggerHaptic('levelChange'); focusTo(i); }}
+                    onClick={() => {
+                      triggerHaptic('levelChange');
+                      if (isAlbum) setOpenAlbum(item);
+                      else focusTo(i);
+                    }}
                     style={{
                       position: 'absolute',
                       left: '50%',
@@ -1186,24 +1359,32 @@ const ILoveMusic = () => {
                     <div style={{ position: 'absolute', inset: 0, transform: 'translateY(4px) scale(0.985)', background: `color-mix(in srgb, ${c.frame} 55%, #000)`, borderRadius: '13px' }} />
                     <div style={{ position: 'absolute', inset: 0, borderRadius: '13px', overflow: 'hidden', background: c.frame, border: '1px solid rgba(255,255,255,0.12)', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18)' }}>
                       <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', padding: '13px 18px 11px', color: c.ink }}>
-                        <span style={{ fontWeight: 700, fontSize: '17px', letterSpacing: '-0.2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
-                        <span style={{ fontSize: '14px', opacity: 0.72, whiteSpace: 'nowrap' }}>{t.artist}</span>
+                        <span style={{ fontWeight: 700, fontSize: '17px', letterSpacing: '-0.2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.title}</span>
+                        <span style={{ fontSize: '14px', opacity: 0.72, whiteSpace: 'nowrap' }}>{item.artist}</span>
                         <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                          {sourceBadge(t.source) && (
+                          {sourceBadge(item.source) && (
                             <span style={{ fontFamily: MONO, fontSize: '9px', fontWeight: 700, letterSpacing: '0.5px', color: c.ink, opacity: 0.85, padding: '1px 5px', borderRadius: '4px', border: `1px solid ${c.ink}`, lineHeight: 1.5 }}>
-                              {sourceBadge(t.source)}
+                              {sourceBadge(item.source)}
                             </span>
                           )}
                           <span style={{ fontFamily: MONO, fontSize: '11px', opacity: 0.62, whiteSpace: 'nowrap' }}>
-                            {t.bpm ? `${t.bpm} BPM` : '—'}{t.key ? ` · ${t.key}` : ''}
+                            {isAlbum
+                              ? (downloading ? dlText : (item.source === 'soundcloud' ? 'PLAYLIST' : 'ALBUM'))
+                              : `${item.bpm ? `${item.bpm} BPM` : '—'}${item.key ? ` · ${item.key}` : ''}`}
                           </span>
                         </span>
                       </div>
                       <div style={{ position: 'absolute', left: '14px', right: '14px', bottom: '14px', top: '46px', borderRadius: '8px', overflow: 'hidden', background: 'repeating-linear-gradient(135deg, rgba(0,0,0,0.13) 0 11px, rgba(0,0,0,0.05) 11px 22px)' }}>
-                        {t.artwork ? (
-                          <img src={t.artwork} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+                        {item.artwork ? (
+                          <img src={item.artwork} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
                         ) : (
-                          <ArtPlaceholder radius={8} label="album art" />
+                          <ArtPlaceholder radius={8} label={isAlbum ? 'album' : 'album art'} />
+                        )}
+                        {isAlbum && (
+                          <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, padding: '8px 12px', background: 'linear-gradient(to top, rgba(0,0,0,0.78), transparent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontFamily: MONO, fontSize: '10px', letterSpacing: '0.5px', color: '#fff' }}>
+                            <span>{downloading ? dlText : `${albumCount} TRACKS`}</span>
+                            <span style={{ opacity: 0.8 }}>{downloading ? '' : 'CLICK TO OPEN'}</span>
+                          </div>
                         )}
                       </div>
                     </div>
@@ -1252,18 +1433,21 @@ const ILoveMusic = () => {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 'none', flexShrink: 0 }}>
                   <button onClick={() => focusTo(Math.max(0, focusIdx - 1))} style={{ border: 'none', background: 'none', cursor: 'pointer', color: DIM, display: 'flex', padding: '4px' }}>{ICONS.prev}</button>
                   <button
-                    onClick={() => focused && handlePlay(focused.id)}
+                    onClick={() => {
+                      if (focusedTrack) handlePlay(focusedTrack.id);
+                      else if (focusedAlbum) setOpenAlbum(focusedAlbum);
+                    }}
                     style={{ width: '38px', height: '38px', borderRadius: '50%', border: 'none', cursor: 'pointer', background: ACCENT, color: '#1a1407', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: `0 0 18px ${ACCENT_SOFT}`, flexShrink: 0 }}
                   >
                     {isFocusedPlaying ? ICONS.pause : ICONS.play}
                   </button>
-                  <button onClick={() => focusTo(Math.min(filtered.length - 1, focusIdx + 1))} style={{ border: 'none', background: 'none', cursor: 'pointer', color: DIM, display: 'flex', padding: '4px' }}>{ICONS.next}</button>
+                  <button onClick={() => focusTo(Math.min(shelfItems.length - 1, focusIdx + 1))} style={{ border: 'none', background: 'none', cursor: 'pointer', color: DIM, display: 'flex', padding: '4px' }}>{ICONS.next}</button>
                 </div>
                 <div style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, width: '36px', flexShrink: 0, textAlign: 'right' }}>{focused ? formatTime(focused.currentTime) : '0:00'}</span>
+                  <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, width: '36px', flexShrink: 0, textAlign: 'right' }}>{focusedTrack ? formatTime(focusedTrack.currentTime) : '0:00'}</span>
                   <div
-                    onMouseDown={(e) => focused && handleProgressMouseDown(e, focused)}
-                    onClick={(e) => focused && handleProgressClick(e, focused)}
+                    onMouseDown={(e) => focusedTrack && handleProgressMouseDown(e, focusedTrack)}
+                    onClick={(e) => focusedTrack && handleProgressClick(e, focusedTrack)}
                     style={{ position: 'relative', flex: '1 1 auto', minWidth: 0, height: '30px', overflow: 'hidden', display: 'flex', alignItems: 'center', gap: '1.5px', cursor: 'pointer' }}
                   >
                     {waveBars.map((h, bi) => (
@@ -1272,17 +1456,17 @@ const ILoveMusic = () => {
                     <div style={{ position: 'absolute', top: 0, bottom: 0, right: 0, left: `${npProgress * 100}%`, background: 'rgba(13,13,16,0.66)', borderRadius: '3px', pointerEvents: 'none' }} />
                     <div style={{ position: 'absolute', top: '-2px', bottom: '-2px', left: `${npProgress * 100}%`, width: '2px', background: '#fff', boxShadow: '0 0 8px rgba(255,255,255,0.6)', pointerEvents: 'none' }} />
                   </div>
-                  <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, width: '36px', flexShrink: 0 }}>{focused ? formatTime(focused.duration) : '0:00'}</span>
+                  <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM, width: '36px', flexShrink: 0 }}>{focusedTrack ? formatTime(focusedTrack.duration) : '0:00'}</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flex: 'none', flexShrink: 0, padding: '5px 11px', borderRadius: '9px', background: ACCENT_SOFT, border: '1px solid rgba(230,178,76,0.2)' }}>
-                  <span style={{ fontFamily: MONO, fontWeight: 600, fontSize: '15px', color: ACCENT, lineHeight: 1 }}>{focused && focused.bpm ? focused.bpm : '—'}</span>
+                  <span style={{ fontFamily: MONO, fontWeight: 600, fontSize: '15px', color: ACCENT, lineHeight: 1 }}>{focusedTrack && focusedTrack.bpm ? focusedTrack.bpm : '—'}</span>
                   <span style={{ fontFamily: MONO, fontSize: '8.5px', color: ACCENT, opacity: 0.7, letterSpacing: '0.5px' }}>BPM</span>
                 </div>
               </div>
             </div>
 
             <div style={{ position: 'absolute', left: 0, right: 0, top: '18px', textAlign: 'center', pointerEvents: 'none', fontFamily: MONO, fontSize: '10px', letterSpacing: '2px', color: FAINT }}>
-              ↑ &nbsp;DIGGING THROUGH {filtered.length} RECORDS&nbsp; ↓
+              ↑ &nbsp;DIGGING THROUGH {shelfItems.length} RECORDS&nbsp; ↓
             </div>
             <div style={{ position: 'absolute', left: 0, right: 0, bottom: '118px', textAlign: 'center', pointerEvents: 'none', fontFamily: MONO, fontSize: '10.5px', letterSpacing: '1px', color: DIM }}>
               scroll to dig &nbsp;·&nbsp; click a record to pull it
@@ -1291,7 +1475,7 @@ const ILoveMusic = () => {
         )}
 
         {/* ===== Library empty state ===== */}
-        {isLibrary && filtered.length === 0 && (
+        {isLibrary && shelfItems.length === 0 && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '18px', animation: 'ilm-rise .35s ease' }}>
             <div style={{ width: '74px', height: '74px', borderRadius: '18px', border: `1px solid ${LINE}`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: ACCENT, background: 'rgba(255,255,255,0.02)' }}>{ICONS.library}</div>
             <div style={{ textAlign: 'center', maxWidth: '380px' }}>
@@ -1355,7 +1539,7 @@ const ILoveMusic = () => {
       <aside style={{ display: 'flex', flexDirection: 'column', background: PANEL, borderLeft: `1px solid ${LINE}`, overflowY: 'auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', padding: '18px 22px 14px' }}>
           <div style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '1.6px', color: FAINT }}>INSPECTOR</div>
-          {focused && (
+          {focusedTrack && (
             <button
               onClick={() => setEditing(e => !e)}
               style={{ marginLeft: 'auto', border: `1px solid ${LINE}`, background: editing ? ACCENT : 'transparent', color: editing ? '#1a1407' : DIM, cursor: 'pointer', fontFamily: MONO, fontSize: '10px', letterSpacing: '1px', padding: '5px 11px', borderRadius: '7px' }}
@@ -1368,6 +1552,49 @@ const ILoveMusic = () => {
         {!focused ? (
           <div style={{ padding: '40px 22px', color: DIM, fontSize: '13px', textAlign: 'center', lineHeight: 1.6 }}>
             Pull a record from the shelf to inspect its metadata.
+          </div>
+        ) : focusedAlbum ? (
+          <div style={{ padding: '0 22px 22px' }}>
+            <div style={{ borderRadius: '13px', overflow: 'hidden', aspectRatio: '1 / 1', background: focusedColor.frame, border: `1px solid ${LINE}`, boxShadow: '0 16px 36px rgba(0,0,0,0.45)', position: 'relative' }}>
+              {focusedAlbum.artwork ? (
+                <img src={focusedAlbum.artwork} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+              ) : (
+                <ArtPlaceholder radius={0} label="album" />
+              )}
+            </div>
+            <div style={{ marginTop: '18px' }}>
+              <div style={{ fontSize: '21px', fontWeight: 700, letterSpacing: '-0.4px', lineHeight: 1.15 }}>{focusedAlbum.title}</div>
+              <div style={{ fontSize: '14px', color: DIM, marginTop: '4px' }}>{focusedAlbum.artist}</div>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', marginTop: '16px', flexWrap: 'wrap' }}>
+              <span style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '0.5px', color: DIM, padding: '5px 10px', borderRadius: '20px', border: `1px solid ${LINE}`, background: 'rgba(255,255,255,0.02)' }}>{sourceLabel(focusedAlbum.source)}</span>
+              <span style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '0.5px', color: DIM, padding: '5px 10px', borderRadius: '20px', border: `1px solid ${LINE}`, background: 'rgba(255,255,255,0.02)' }}>
+                {(focusedAlbum.trackCount || (focusedAlbum.tracks ? focusedAlbum.tracks.length : 0))} TRACKS
+              </span>
+              {albumProgress[focusedAlbum.id] && !albumProgress[focusedAlbum.id].done && (
+                <span style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '0.5px', color: ACCENT, padding: '5px 10px', borderRadius: '20px', border: '1px solid rgba(230,178,76,0.3)', background: ACCENT_SOFT }}>
+                  {albumProgress[focusedAlbum.id].total
+                    ? `DOWNLOADING ${albumProgress[focusedAlbum.id].current || 0}/${albumProgress[focusedAlbum.id].total}…`
+                    : 'DOWNLOADING…'}
+                </span>
+              )}
+            </div>
+            <button
+              onClick={() => setOpenAlbum(focusedAlbum)}
+              style={{ width: '100%', marginTop: '18px', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: '13px', fontWeight: 600, padding: '12px', borderRadius: '10px', background: ACCENT, color: '#1a1407' }}
+            >
+              Open Album →
+            </button>
+            <button
+              onClick={() => {
+                const id = focusedAlbum.id;
+                setAlbums(prev => prev.filter(a => a.id !== id));
+                if (openAlbum && openAlbum.id === id) setOpenAlbum(null);
+              }}
+              style={{ width: '100%', marginTop: '10px', border: '1px solid rgba(255,80,80,0.2)', background: 'transparent', color: '#e87a7a', cursor: 'pointer', fontFamily: MONO, fontSize: '10.5px', letterSpacing: '1px', padding: '9px', borderRadius: '9px', textTransform: 'uppercase' }}
+            >
+              ✕ Remove album
+            </button>
           </div>
         ) : (
           <div style={{ padding: '0 22px 22px' }}>
@@ -1506,6 +1733,21 @@ const ILoveMusic = () => {
                 </button>
               </div>
 
+              {(() => {
+                const ut = detectUrlType(pastedUrl);
+                if (!ut || (ut.type !== 'album' && ut.type !== 'playlist')) return null;
+                return (
+                  <div style={{ marginTop: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700, letterSpacing: '1px', color: ACCENT, background: ACCENT_SOFT, border: '1px solid rgba(230,178,76,0.3)', padding: '4px 10px', borderRadius: '20px' }}>
+                      {ut.type === 'playlist' ? 'PLAYLIST' : 'ALBUM'}
+                    </span>
+                    <span style={{ fontFamily: MONO, fontSize: '10.5px', color: DIM }}>
+                      {ut.source === 'spotify' ? 'Each track fetched via search — downloads as an album card' : 'Will download as an album card'}
+                    </span>
+                  </div>
+                );
+              })()}
+
               {loadingTrack && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '22px', color: DIM, fontFamily: MONO, fontSize: '12px' }}>
                   <span style={{ width: '16px', height: '16px', border: `2px solid ${LINE}`, borderTopColor: ACCENT, borderRadius: '50%', display: 'inline-block', animation: 'ilm-spin .7s linear infinite' }} />
@@ -1584,6 +1826,86 @@ const ILoveMusic = () => {
               <div style={{ width: `${downloadProgress}%`, height: '100%', background: 'linear-gradient(90deg, var(--accent), #caa055)', transition: 'width 0.3s ease-out' }} />
             </div>
           )}
+        </div>
+      )}
+
+      {/* ===================== INNER ALBUM SHELF (overlay) ===================== */}
+      {openAlbum && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 90, background: 'var(--bg)', display: 'flex', flexDirection: 'column', animation: 'ilm-rise .25s ease' }}>
+          {/* Hidden audio elements for this album's tracks */}
+          <div style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }}>
+            {(openAlbum.tracks || []).map(track => (
+              <audio
+                key={track.id}
+                ref={el => { if (el) audioRefs.current[track.id] = el; }}
+                src={track.url}
+                preload="metadata"
+                crossOrigin="anonymous"
+              />
+            ))}
+          </div>
+
+          {/* Header */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', padding: '18px 26px', borderBottom: `1px solid ${LINE}`, background: 'rgba(8,8,10,0.6)' }}>
+            <button
+              onClick={() => {
+                if (playingTrack && audioRefs.current[playingTrack]) audioRefs.current[playingTrack].pause();
+                setPlayingTrack(null);
+                setOpenAlbum(null);
+              }}
+              style={{ border: `1px solid ${LINE}`, background: 'transparent', color: INK, cursor: 'pointer', fontFamily: MONO, fontSize: '11px', letterSpacing: '0.5px', padding: '8px 14px', borderRadius: '9px' }}
+            >
+              ← Back
+            </button>
+            <AlbumArt track={openAlbum} size={40} radius={8} />
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: '16px', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{openAlbum.title}</div>
+              <div style={{ fontSize: '12px', color: DIM, whiteSpace: 'nowrap' }}>
+                {openAlbum.artist} · {(openAlbum.tracks ? openAlbum.tracks.length : 0)} tracks
+              </div>
+            </div>
+            <span style={{ marginLeft: 'auto', fontFamily: MONO, fontSize: '11px', letterSpacing: '0.5px', color: DIM }}>{sourceLabel(openAlbum.source)}</span>
+          </div>
+
+          {/* Track list */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 26px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {openAlbum.tracks && openAlbum.tracks.length ? (
+              openAlbum.tracks.map((track, i) => {
+                const isPlaying = playingTrack === track.id;
+                const tm = albumTimes[track.id] || {};
+                const dur = track.duration || tm.duration || 0;
+                const cur = tm.currentTime || 0;
+                const prog = dur > 0 ? cur / dur : 0;
+                return (
+                  <div key={track.id} style={{ display: 'flex', alignItems: 'center', gap: '14px', padding: '10px 14px', borderRadius: '10px', background: 'rgba(255,255,255,0.03)', border: `1px solid ${LINE}` }}>
+                    <span style={{ fontFamily: MONO, fontSize: '11px', color: FAINT, width: '20px', textAlign: 'right', flexShrink: 0 }}>{i + 1}</span>
+                    <button
+                      onClick={() => handlePlay(track.id)}
+                      style={{ width: '30px', height: '30px', borderRadius: '50%', border: 'none', cursor: 'pointer', background: ACCENT, color: '#1a1407', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+                    >
+                      {isPlaying ? ICONS.pause : ICONS.play}
+                    </button>
+                    <AlbumArt track={track} size={36} radius={6} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: '13px', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{track.title}</div>
+                      <div style={{ fontSize: '11px', color: DIM, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{track.artist}</div>
+                      <div onClick={(e) => handleAlbumSeek(e, track)} style={{ height: '3px', marginTop: '6px', background: 'rgba(255,255,255,0.12)', cursor: 'pointer', position: 'relative', borderRadius: '2px' }}>
+                        <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${prog * 100}%`, background: ACCENT, borderRadius: '2px' }} />
+                      </div>
+                    </div>
+                    {track.bpm ? (
+                      <span style={{ fontFamily: MONO, fontSize: '11px', color: DIM, flexShrink: 0 }}>{track.bpm} BPM</span>
+                    ) : null}
+                    <span style={{ fontFamily: MONO, fontSize: '11px', color: DIM, flexShrink: 0, width: '84px', textAlign: 'right' }}>{formatTime(cur)} / {formatTime(dur)}</span>
+                  </div>
+                );
+              })
+            ) : (
+              <div style={{ color: DIM, textAlign: 'center', padding: '48px', fontFamily: MONO, fontSize: '12px' }}>
+                {albumProgress[openAlbum.id] && !albumProgress[openAlbum.id].done ? 'Downloading album tracks…' : 'No tracks in this album yet.'}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
