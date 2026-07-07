@@ -125,7 +125,3 @@ MIT
 
 - Repository: https://github.com/0xRipo/ILoveMusic
 - Issues: https://github.com/0xRipo/ILoveMusic/issues
-
----
-
-Made with love, caffeine, and loud speakers.

@@ -262,6 +262,11 @@ const ILoveMusic = () => {
   const [albumProgress, setAlbumProgress] = useState({}); // { [albumId]: { ...progress, done } }
   const [albumTimes, setAlbumTimes] = useState({}); // { [trackId]: { currentTime, duration } } for inner shelf
 
+  /* ===== Crate (download wishlist) ===== */
+  const [crate, setCrate] = useState([]);
+  const [crateLoaded, setCrateLoaded] = useState(false);
+  const [crateOpen, setCrateOpen] = useState(false);
+
   /* ===== New UI-only state (spatial shell) ===== */
   const [view, setView] = useState('library'); // library | playlists | collections | bpm | settings
   const [selectedIndex, setSelectedIndex] = useState(0); // focused card (inspector / now-playing)
@@ -369,6 +374,29 @@ const ILoveMusic = () => {
     window.electron.saveAlbums(toSave);
   }, [albums, albumsLoaded]);
 
+  // Load crate on mount.
+  useEffect(() => {
+    const load = async () => {
+      try {
+        if (window.electron && window.electron.loadCrate) {
+          const result = await window.electron.loadCrate();
+          if (result.success && result.crate) setCrate(result.crate);
+        }
+      } catch (err) {
+        console.error('Error loading crate:', err);
+      } finally {
+        setCrateLoaded(true);
+      }
+    };
+    load();
+  }, []);
+
+  // Persist crate on change.
+  useEffect(() => {
+    if (!crateLoaded) return;
+    if (window.electron && window.electron.saveCrate) window.electron.saveCrate(crate);
+  }, [crate, crateLoaded]);
+
   // Album download IPC listeners (registered once for the app lifetime).
   useEffect(() => {
     if (!window.electron) return;
@@ -469,6 +497,86 @@ const ILoveMusic = () => {
     }
     setPastedUrl('');
     setDownloadOpen(false);
+  };
+
+  /* ===== Crate helpers ===== */
+  const crateKeyFor = (track, sourceUrl) =>
+    sourceUrl || track.sourceUrl || track.filePath || track.id || `${track.title}::${track.artist}`;
+
+  const isInCrate = (track, sourceUrl) => {
+    const key = crateKeyFor(track, sourceUrl);
+    return crate.some(c => c.id === key || (c.title === track.title && c.artist === track.artist));
+  };
+
+  const addToCrate = (track, sourceUrl, fromAlbum = null) => {
+    const id = crateKeyFor(track, sourceUrl);
+    console.log('[CRATE] add:', track && track.title, '→ id:', id); // TEMP diagnostic
+    setCrate(prev => {
+      if (prev.some(c => c.id === id || (c.title === track.title && c.artist === track.artist))) {
+        console.log('[CRATE] already present, skip'); // TEMP diagnostic
+        return prev;
+      }
+      const next = [
+        ...prev,
+        {
+          id,
+          title: track.title,
+          artist: track.artist,
+          artwork: track.artwork ?? null,
+          bpm: track.bpm ?? null,
+          key: track.key ?? null,
+          duration: track.duration ?? null,
+          source: track.source,
+          sourceUrl: sourceUrl || track.sourceUrl || null,
+          fromAlbum,
+          addedAt: new Date().toISOString(),
+          status: 'queued',
+        },
+      ];
+      console.log('[CRATE] new length:', next.length); // TEMP diagnostic
+      return next;
+    });
+  };
+
+  const removeFromCrate = (id) => setCrate(prev => prev.filter(i => i.id !== id));
+  const setCrateItemStatus = (id, status) => setCrate(prev => prev.map(i => (i.id === id ? { ...i, status } : i)));
+
+  // Crate downloads reuse the real single-track IPC (addSoundCloud routes
+  // SoundCloud/Bandcamp/Spotify by URL), then add + enrich into the library.
+  const handleCrateDownloadOne = async (item) => {
+    if (!item.sourceUrl) {
+      setCrateItemStatus(item.id, 'error');
+      return;
+    }
+    if (!window.electron || !window.electron.addSoundCloud) return;
+    setCrateItemStatus(item.id, 'downloading');
+    try {
+      const track = await window.electron.addSoundCloud(item.sourceUrl);
+      setTracks(prev => [...prev, track]);
+      enrichTrack(track);
+      setCrateItemStatus(item.id, 'done');
+    } catch (err) {
+      console.error('Crate download failed:', err);
+      setCrateItemStatus(item.id, 'error');
+    }
+  };
+
+  const handleCrateDownloadAll = async () => {
+    const queued = crate.filter(i => i.status === 'queued' && i.sourceUrl);
+    for (const item of queued) {
+      // eslint-disable-next-line no-await-in-loop
+      await handleCrateDownloadOne(item);
+    }
+  };
+
+  const handleAlbumDownloadFull = (album) => {
+    (album.tracks || []).forEach(track => {
+      if (!isInCrate(track, track.sourceUrl)) {
+        addToCrate(track, track.sourceUrl, { albumId: album.id, albumTitle: album.title });
+      }
+    });
+    setOpenAlbum(null);
+    setCrateOpen(true);
   };
 
   const handleAddSoundCloud = async () => {
@@ -1055,6 +1163,16 @@ const ILoveMusic = () => {
     textOverflow: 'ellipsis',
   };
 
+  // Monospace metadata pill for album cards (muted when the value is absent).
+  const statPill = (muted) => ({
+    fontSize: '10px',
+    fontFamily: MONO,
+    color: muted ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.5)',
+    background: 'rgba(255,255,255,0.06)',
+    padding: '2px 6px',
+    borderRadius: '4px',
+  });
+
   /* Shared small style helpers */
   const fieldStyle = {
     background: 'rgba(255,255,255,0.04)',
@@ -1358,6 +1476,9 @@ const ILoveMusic = () => {
                     <div style={{ position: 'absolute', inset: 0, transform: 'translateY(8px) scale(0.97)', background: '#050506', borderRadius: '13px', boxShadow: '0 50px 90px rgba(0,0,0,0.7)' }} />
                     <div style={{ position: 'absolute', inset: 0, transform: 'translateY(4px) scale(0.985)', background: `color-mix(in srgb, ${c.frame} 55%, #000)`, borderRadius: '13px' }} />
                     <div style={{ position: 'absolute', inset: 0, borderRadius: '13px', overflow: 'hidden', background: c.frame, border: '1px solid rgba(255,255,255,0.12)', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18)' }}>
+                      {!isAlbum && isInCrate(item, item.sourceUrl) && (
+                        <span title="In Crate" style={{ position: 'absolute', top: '8px', right: '8px', zIndex: 2, fontSize: '12px', background: 'rgba(0,0,0,0.6)', borderRadius: '4px', padding: '2px 4px', pointerEvents: 'none' }}>🗂</span>
+                      )}
                       <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', padding: '13px 18px 11px', color: c.ink }}>
                         <span style={{ fontWeight: 700, fontSize: '17px', letterSpacing: '-0.2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.title}</span>
                         <span style={{ fontSize: '14px', opacity: 0.72, whiteSpace: 'nowrap' }}>{item.artist}</span>
@@ -1467,9 +1588,6 @@ const ILoveMusic = () => {
 
             <div style={{ position: 'absolute', left: 0, right: 0, top: '18px', textAlign: 'center', pointerEvents: 'none', fontFamily: MONO, fontSize: '10px', letterSpacing: '2px', color: FAINT }}>
               ↑ &nbsp;DIGGING THROUGH {shelfItems.length} RECORDS&nbsp; ↓
-            </div>
-            <div style={{ position: 'absolute', left: 0, right: 0, bottom: '118px', textAlign: 'center', pointerEvents: 'none', fontFamily: MONO, fontSize: '10.5px', letterSpacing: '1px', color: DIM }}>
-              scroll to dig &nbsp;·&nbsp; click a record to pull it
             </div>
           </div>
         )}
@@ -1780,52 +1898,44 @@ const ILoveMusic = () => {
         </div>
       )}
 
-      {/* ===================== FLOATING DOWNLOAD BAR (selected) ===================== */}
+      {/* ===================== SELECTION BAR (floating, above now-playing) ===================== */}
       {selected.size > 0 && (
         <div
           style={{
             position: 'fixed',
-            bottom: '24px',
+            bottom: '104px',
             left: 'calc((100vw - 338px) / 2)',
             transform: 'translateX(-50%)',
-            maxWidth: '560px',
-            width: 'calc(100vw - 338px - 80px)',
-            minWidth: '360px',
-            padding: '14px 20px',
-            background: 'rgba(14,14,17,0.88)',
-            backdropFilter: 'blur(20px)',
-            border: '1px solid rgba(230,178,76,0.3)',
-            borderRadius: '14px',
-            color: '#fff',
+            zIndex: 40,
             display: 'flex',
-            flexDirection: 'column',
-            gap: '12px',
-            fontSize: '11px',
-            letterSpacing: '0.02em',
-            textTransform: 'uppercase',
-            boxShadow: '0 18px 50px rgba(0,0,0,0.5)',
-            zIndex: 60,
+            alignItems: 'center',
+            gap: '16px',
+            maxWidth: 'calc(100vw - 378px)',
+            padding: '11px 18px',
+            borderRadius: '16px',
+            background: 'rgba(14,14,17,0.82)',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(255,255,255,0.09)',
+            boxShadow: '0 18px 50px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.06)',
           }}
         >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontFamily: MONO, color: DIM }}>{selected.size} SELECTED</span>
-            <button
-              onClick={handleDownload}
-              disabled={downloading}
-              style={{ fontFamily: MONO, fontSize: '11px', letterSpacing: '0.5px', textTransform: 'uppercase', padding: '8px 20px', border: 'none', background: ACCENT, color: '#1a1407', cursor: downloading ? 'wait' : 'pointer', borderRadius: '9px', fontWeight: 600, opacity: downloading ? 0.6 : 1 }}
-            >
-              {downloading
-                ? `DOWNLOADING… ${downloadProgress}%`
-                : selected.size === 1
-                  ? 'DOWNLOAD TRACK'
-                  : `DOWNLOAD ${selected.size} AS ZIP`}
-            </button>
-          </div>
+          <span style={{ fontFamily: MONO, fontSize: '11px', letterSpacing: '0.05em', textTransform: 'uppercase', color: DIM, whiteSpace: 'nowrap' }}>{selected.size} SELECTED</span>
           {downloading && (
-            <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', overflow: 'hidden' }}>
+            <div style={{ width: '120px', height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', overflow: 'hidden' }}>
               <div style={{ width: `${downloadProgress}%`, height: '100%', background: 'linear-gradient(90deg, var(--accent), #caa055)', transition: 'width 0.3s ease-out' }} />
             </div>
           )}
+          <button
+            onClick={handleDownload}
+            disabled={downloading}
+            style={{ fontFamily: MONO, fontSize: '11px', letterSpacing: '0.5px', textTransform: 'uppercase', padding: '8px 20px', border: 'none', background: ACCENT, color: '#1a1407', cursor: downloading ? 'wait' : 'pointer', borderRadius: '9px', fontWeight: 600, opacity: downloading ? 0.6 : 1, whiteSpace: 'nowrap' }}
+          >
+            {downloading
+              ? `DOWNLOADING… ${downloadProgress}%`
+              : selected.size === 1
+                ? 'DOWNLOAD TRACK'
+                : `DOWNLOAD ${selected.size} AS ZIP`}
+          </button>
         </div>
       )}
 
@@ -1865,49 +1975,131 @@ const ILoveMusic = () => {
               </div>
             </div>
             <span style={{ marginLeft: 'auto', fontFamily: MONO, fontSize: '11px', letterSpacing: '0.5px', color: DIM }}>{sourceLabel(openAlbum.source)}</span>
+            {openAlbum.tracks && openAlbum.tracks.length > 0 && (
+              <button
+                onClick={() => handleAlbumDownloadFull(openAlbum)}
+                style={{ border: 'none', cursor: 'pointer', background: ACCENT, color: '#1a1407', fontFamily: 'inherit', fontSize: '12px', fontWeight: 600, padding: '9px 14px', borderRadius: '9px', flexShrink: 0 }}
+              >
+                ↓ Download Full Album
+              </button>
+            )}
           </div>
 
-          {/* Track list */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 26px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {/* Card grid — auto-fill, minmax 190px */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '24px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: '16px', alignContent: 'start' }}>
             {openAlbum.tracks && openAlbum.tracks.length ? (
               openAlbum.tracks.map((track, i) => {
                 const isPlaying = playingTrack === track.id;
-                const tm = albumTimes[track.id] || {};
-                const dur = track.duration || tm.duration || 0;
-                const cur = tm.currentTime || 0;
-                const prog = dur > 0 ? cur / dur : 0;
+                const inCrate = isInCrate(track, track.sourceUrl);
                 return (
-                  <div key={track.id} style={{ display: 'flex', alignItems: 'center', gap: '14px', padding: '10px 14px', borderRadius: '10px', background: 'rgba(255,255,255,0.03)', border: `1px solid ${LINE}` }}>
-                    <span style={{ fontFamily: MONO, fontSize: '11px', color: FAINT, width: '20px', textAlign: 'right', flexShrink: 0 }}>{i + 1}</span>
-                    <button
-                      onClick={() => handlePlay(track.id)}
-                      style={{ width: '30px', height: '30px', borderRadius: '50%', border: 'none', cursor: 'pointer', background: ACCENT, color: '#1a1407', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
-                    >
-                      {isPlaying ? ICONS.pause : ICONS.play}
-                    </button>
-                    <AlbumArt track={track} size={36} radius={6} />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: '13px', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{track.title}</div>
-                      <div style={{ fontSize: '11px', color: DIM, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{track.artist}</div>
-                      <div onClick={(e) => handleAlbumSeek(e, track)} style={{ height: '3px', marginTop: '6px', background: 'rgba(255,255,255,0.12)', cursor: 'pointer', position: 'relative', borderRadius: '2px' }}>
-                        <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${prog * 100}%`, background: ACCENT, borderRadius: '2px' }} />
-                      </div>
+                  <div
+                    key={track.id ?? i}
+                    onClick={() => handlePlay(track.id)}
+                    style={{ background: '#111', borderRadius: '12px', overflow: 'hidden', cursor: 'pointer', border: `1px solid ${isPlaying ? ACCENT : LINE}`, display: 'flex', flexDirection: 'column' }}
+                  >
+                    {/* Artwork — square, full width, top. flexShrink:0 so it can
+                        never collapse the metadata section below it. */}
+                    <div style={{ width: '100%', aspectRatio: '1', background: '#1a1a1a', flexShrink: 0 }}>
+                      {track.artwork ? (
+                        <img src={track.artwork} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                      ) : (
+                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '32px', color: 'rgba(255,255,255,0.2)' }}>♪</div>
+                      )}
                     </div>
-                    {track.bpm ? (
-                      <span style={{ fontFamily: MONO, fontSize: '11px', color: DIM, flexShrink: 0 }}>{track.bpm} BPM</span>
-                    ) : null}
-                    <span style={{ fontFamily: MONO, fontSize: '11px', color: DIM, flexShrink: 0, width: '84px', textAlign: 'right' }}>{formatTime(cur)} / {formatTime(dur)}</span>
+                    {/* Metadata — title, artist, BPM/key/duration, + Crate */}
+                    <div style={{ padding: '10px', display: 'flex', flexDirection: 'column', gap: '4px', flexShrink: 0 }}>
+                      <span title={track.title} style={{ fontSize: '13px', fontWeight: 600, color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{track.title}</span>
+                      <span title={track.artist} style={{ fontSize: '11px', color: 'rgba(255,255,255,0.5)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{track.artist}</span>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '2px', fontFamily: MONO, fontSize: '10px', color: 'rgba(255,255,255,0.4)' }}>
+                        <span>{track.bpm ? `${track.bpm} BPM` : '— BPM'}</span>
+                        <span>{track.key || '—'}</span>
+                        <span>{track.duration ? formatTime(track.duration) : '—'}</span>
+                      </div>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); addToCrate(track, track.sourceUrl, { albumId: openAlbum.id, albumTitle: openAlbum.title }); }}
+                        style={{ marginTop: '6px', padding: '5px 10px', borderRadius: '6px', fontSize: '11px', letterSpacing: '0.03em', border: `1px solid ${inCrate ? ACCENT : 'rgba(255,255,255,0.12)'}`, background: 'transparent', color: inCrate ? ACCENT : 'rgba(255,255,255,0.5)', cursor: 'pointer', alignSelf: 'flex-start', fontFamily: 'inherit' }}
+                      >
+                        {inCrate ? '✓ In Crate' : '+ Crate'}
+                      </button>
+                    </div>
                   </div>
                 );
               })
             ) : (
-              <div style={{ color: DIM, textAlign: 'center', padding: '48px', fontFamily: MONO, fontSize: '12px' }}>
+              <div style={{ gridColumn: '1 / -1', color: DIM, textAlign: 'center', padding: '48px', fontFamily: MONO, fontSize: '12px' }}>
                 {albumProgress[openAlbum.id] && !albumProgress[openAlbum.id].done ? 'Downloading album tracks…' : 'No tracks in this album yet.'}
               </div>
             )}
           </div>
         </div>
       )}
+
+      {/* ===================== CRATE PANEL (right slide-in) =====================
+          Always mounted; slides in/out via transform so crate state is never
+          lost to conditional unmount. */}
+      <div style={{ position: 'fixed', top: 0, right: 0, width: '360px', maxWidth: '90vw', height: '100vh', background: '#0d0d0d', borderLeft: `1px solid ${LINE}`, zIndex: 200, display: 'flex', flexDirection: 'column', overflow: 'hidden', transform: crateOpen ? 'translateX(0)' : 'translateX(100%)', transition: 'transform 0.22s ease', pointerEvents: crateOpen ? 'auto' : 'none', boxShadow: crateOpen ? '-20px 0 50px rgba(0,0,0,0.5)' : 'none' }}>
+          <div style={{ padding: '20px', borderBottom: `1px solid ${LINE}`, display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontFamily: MONO, fontSize: '12px', letterSpacing: '1.6px', color: INK }}>CRATE</span>
+            <span style={{ fontFamily: MONO, fontSize: '10px', color: DIM }}>
+              {crate.filter(i => i.status === 'queued').length} queued · {crate.filter(i => i.status === 'done').length} downloaded
+            </span>
+            <button onClick={() => setCrateOpen(false)} style={{ marginLeft: 'auto', border: 'none', background: 'rgba(255,255,255,0.05)', color: DIM, width: '28px', height: '28px', borderRadius: '8px', cursor: 'pointer' }}>✕</button>
+          </div>
+
+          {crate.some(i => i.status === 'queued') && (
+            <button
+              onClick={handleCrateDownloadAll}
+              style={{ margin: '12px 16px', padding: '12px', background: ACCENT, color: '#1a1407', border: 'none', borderRadius: '8px', fontWeight: 700, fontSize: '13px', cursor: 'pointer', letterSpacing: '0.05em' }}
+            >
+              ↓ Download All ({crate.filter(i => i.status === 'queued').length})
+            </button>
+          )}
+
+          <div style={{ flex: 1, overflowY: 'auto', padding: '8px' }}>
+            {crate.length === 0 && (
+              <div style={{ padding: '40px 20px', color: DIM, fontSize: '12px', textAlign: 'center', fontFamily: MONO, lineHeight: 1.6 }}>
+                Add tracks from the shelf or album view
+              </div>
+            )}
+            {crate.map(item => (
+              <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px', borderRadius: '8px', marginBottom: '4px', background: 'rgba(255,255,255,0.03)' }}>
+                <div style={{ width: '44px', height: '44px', borderRadius: '6px', overflow: 'hidden', flexShrink: 0, background: '#1a1a1a', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {item.artwork
+                    ? <img src={item.artwork} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    : <span style={{ color: 'rgba(255,255,255,0.45)', fontSize: '18px' }}>♪</span>}
+                </div>
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                  <span style={{ fontSize: '13px', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: '#fff' }}>{item.title}</span>
+                  <span style={{ fontSize: '11px', color: DIM, fontFamily: MONO, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {item.artist}{item.bpm ? ` · ${item.bpm} BPM` : ''}{item.key ? ` · ${item.key}` : ''}
+                  </span>
+                  {item.fromAlbum && (
+                    <span style={{ fontSize: '10px', color: ACCENT, opacity: 0.7, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.fromAlbum.albumTitle}</span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+                  {item.status === 'queued' && (
+                    <>
+                      <button
+                        onClick={() => handleCrateDownloadOne(item)}
+                        disabled={!item.sourceUrl}
+                        title={item.sourceUrl ? 'Download' : 'No source URL to download from'}
+                        style={{ width: '26px', height: '26px', border: `1px solid ${LINE}`, borderRadius: '6px', background: 'transparent', color: INK, cursor: item.sourceUrl ? 'pointer' : 'not-allowed', opacity: item.sourceUrl ? 1 : 0.4 }}
+                      >↓</button>
+                      <button
+                        onClick={() => removeFromCrate(item.id)}
+                        style={{ width: '26px', height: '26px', border: `1px solid ${LINE}`, borderRadius: '6px', background: 'transparent', color: '#e87a7a', cursor: 'pointer' }}
+                      >✕</button>
+                    </>
+                  )}
+                  {item.status === 'downloading' && <span style={{ fontFamily: MONO, fontSize: '10px', padding: '3px 7px', borderRadius: '4px', letterSpacing: '0.05em', background: 'rgba(255,200,0,0.15)', color: '#ffc800' }}>DOWNLOADING</span>}
+                  {item.status === 'done' && <span style={{ fontFamily: MONO, fontSize: '10px', padding: '3px 7px', borderRadius: '4px', letterSpacing: '0.05em', background: 'rgba(0,200,100,0.15)', color: '#00c864' }}>✓ DONE</span>}
+                  {item.status === 'error' && <span style={{ fontFamily: MONO, fontSize: '10px', padding: '3px 7px', borderRadius: '4px', letterSpacing: '0.05em', background: 'rgba(255,60,60,0.15)', color: '#ff3c3c' }}>FAILED</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+      </div>
     </div>
   );
 };

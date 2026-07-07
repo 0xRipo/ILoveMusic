@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
@@ -2698,7 +2698,7 @@ ipcMain.handle('tracks:load', async () => {
 // Scan a downloaded album folder and build full track objects (same shape as
 // single-track downloads). Title/artist/duration/artwork come from embedded
 // ID3 via music-metadata (ESM → dynamic import). BPM/key are left null for now.
-async function buildAlbumTracksFromFolder(dir, source) {
+async function buildAlbumTracksFromFolder(dir, source, sourceUrls = []) {
   const mm = await import('music-metadata');
   const exts = ['.mp3', '.m4a', '.flac', '.wav', '.opus', '.ogg'];
   let files = [];
@@ -2707,6 +2707,8 @@ async function buildAlbumTracksFromFolder(dir, source) {
   } catch {
     return [];
   }
+  // Filenames are zero-padded by index, so alphabetical sort == playlist order,
+  // which lets sourceUrls[i] line up with each downloaded track.
   files.sort();
   const tracks = [];
   const base = Date.now();
@@ -2738,6 +2740,7 @@ async function buildAlbumTracksFromFolder(dir, source) {
       key: null,
       artwork,
       source,
+      sourceUrl: sourceUrls[i] || null, // original URL, for re-download via the crate
     });
   }
   return tracks;
@@ -2761,6 +2764,7 @@ ipcMain.handle('download-sc-bandcamp-album', async (event, { url, source } = {})
       console.warn('Album metadata fetch failed:', e.message);
     }
     const entries = Array.isArray(info.entries) ? info.entries : [];
+    const entryUrls = entries.map(e => e.url || e.webpage_url || null); // per-track URLs (for crate re-download)
     const albumMeta = {
       id: albumId,
       title: info.title || 'Unknown Album',
@@ -2773,7 +2777,7 @@ ipcMain.handle('download-sc-bandcamp-album', async (event, { url, source } = {})
     };
     event.sender.send('album-meta-ready', albumMeta);
 
-    // Download the whole playlist.
+    // Download the whole playlist (zero-padded index keeps file order == playlist order).
     await new Promise((resolve, reject) => {
       const args = [
         '-x',
@@ -2781,7 +2785,7 @@ ipcMain.handle('download-sc-bandcamp-album', async (event, { url, source } = {})
         '--audio-quality', '0',
         '--embed-thumbnail',
         '--embed-metadata',
-        '-o', path.join(outputDir, '%(playlist_index)s - %(title)s.%(ext)s'),
+        '-o', path.join(outputDir, '%(playlist_index)02d - %(title)s.%(ext)s'),
         '--newline',
         url,
       ];
@@ -2795,7 +2799,7 @@ ipcMain.handle('download-sc-bandcamp-album', async (event, { url, source } = {})
     });
 
     // Build real track objects from the downloaded files.
-    const tracks = await buildAlbumTracksFromFolder(outputDir, source);
+    const tracks = await buildAlbumTracksFromFolder(outputDir, source, entryUrls);
     const artwork = albumMeta.artwork || (tracks.find(t => t.artwork) || {}).artwork || null;
     event.sender.send('album-tracks-ready', { albumId, tracks, artwork });
 
@@ -2881,8 +2885,10 @@ ipcMain.handle('download-spotify-album', async (event, albumUrl) => {
       }
     }
 
-    // Build real track objects from the downloaded files.
-    const tracks = await buildAlbumTracksFromFolder(outputDir, 'spotify');
+    // Build real track objects from the downloaded files. Spotify track URLs
+    // (in download order) become each track's sourceUrl for crate re-download.
+    const spotifyUrls = allTracks.map(t => (t.id ? `https://open.spotify.com/track/${t.id}` : null));
+    const tracks = await buildAlbumTracksFromFolder(outputDir, 'spotify', spotifyUrls);
     const artwork = albumMeta.artwork || (tracks.find(t => t.artwork) || {}).artwork || null;
     event.sender.send('album-tracks-ready', { albumId, tracks, artwork });
 
@@ -2917,5 +2923,37 @@ ipcMain.handle('albums:load', async () => {
   } catch (error) {
     console.error('Error loading albums:', error);
     return { success: true, albums: [] };
+  }
+});
+
+// Reveal a downloaded track file in Finder / file explorer.
+ipcMain.handle('show-in-finder', (_, filePath) => {
+  if (filePath) shell.showItemInFolder(filePath);
+});
+
+// Persist the crate (download wishlist) — mirror of albums:save / albums:load.
+ipcMain.handle('crate:save', async (_, crate) => {
+  try {
+    const userDataPath = app.getPath('userData');
+    const crateFilePath = path.join(userDataPath, 'crate.json');
+    if (!fs.existsSync(userDataPath)) fs.mkdirSync(userDataPath, { recursive: true });
+    fs.writeFileSync(crateFilePath, JSON.stringify(crate, null, 2), 'utf8');
+    return { success: true };
+  } catch (error) {
+    console.error('Error saving crate:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('crate:load', async () => {
+  try {
+    const userDataPath = app.getPath('userData');
+    const crateFilePath = path.join(userDataPath, 'crate.json');
+    if (!fs.existsSync(crateFilePath)) return { success: true, crate: [] };
+    const crate = JSON.parse(fs.readFileSync(crateFilePath, 'utf8'));
+    return { success: true, crate };
+  } catch (error) {
+    console.error('Error loading crate:', error);
+    return { success: true, crate: [] };
   }
 });
