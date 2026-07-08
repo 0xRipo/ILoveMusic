@@ -1246,6 +1246,33 @@ const ILoveMusic = () => {
         overflow: 'hidden',
       }}
     >
+      {/* macOS traffic light drag region */}
+      <div
+        style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          height: '48px',
+          WebkitAppRegion: 'drag',
+          zIndex: 9999,
+          pointerEvents: 'none',
+        }}
+      >
+        {/* Allow clicks on buttons/inputs by making them draggable */}
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: '90px', // After traffic lights (15 + 3*20 + padding)
+            right: 0,
+            bottom: 0,
+            WebkitAppRegion: 'no-drag',
+            pointerEvents: 'auto',
+          }}
+        />
+      </div>
+
       {/* Hidden audio elements (one per track) */}
       <div style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }}>
         {tracks.map(track => (
@@ -1285,6 +1312,7 @@ const ILoveMusic = () => {
             alignItems: 'center',
             gap: '18px',
             padding: '18px 26px',
+            paddingTop: '58px', // Space for macOS traffic lights
             borderBottom: `1px solid ${LINE}`,
             zIndex: 20,
             background: 'rgba(8,8,10,0.4)',
@@ -1655,7 +1683,7 @@ const ILoveMusic = () => {
 
       {/* ===================== RIGHT INSPECTOR ===================== */}
       <aside style={{ display: 'flex', flexDirection: 'column', background: PANEL, borderLeft: `1px solid ${LINE}`, overflowY: 'auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', padding: '18px 22px 14px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', padding: '18px 22px 14px', paddingTop: '58px' }}>
           <div style={{ fontFamily: MONO, fontSize: '10px', letterSpacing: '1.6px', color: FAINT }}>INSPECTOR</div>
           {focusedTrack && (
             <button

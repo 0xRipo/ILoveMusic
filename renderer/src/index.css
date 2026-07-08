@@ -57,13 +57,29 @@ body {
   background: rgba(230, 178, 76, 0.3);
 }
 
+/* Hide scrollbar completely */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 0px;
+  height: 0px;
+  display: none;
 }
+
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
+  display: none;
+}
+
+::-webkit-scrollbar-track {
+  display: none;
+}
+
+/* Firefox scrollbar hide */
+* {
+  scrollbar-width: none;
+}
+
+/* IE scrollbar hide */
+* {
+  -ms-overflow-style: none;
 }
 
 button {

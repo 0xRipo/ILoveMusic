@@ -518,6 +518,8 @@ npm run dev
 # This runs:
 # 1. Vite dev server (renderer)
 # 2. Electron app (main process)
+
+# Traffic lights akan muncul di macOS (🔴 🟡 🟢)
 ```
 
 ### Building
@@ -811,7 +813,13 @@ const zipName = `ILoveMusic_Export_${Date.now()}.zip`
 
 ## 📝 VERSION HISTORY
 
-### v0.2.1 (Current) - June 2026
+### v0.2.2 (Current) - June 2026
+- macOS traffic lights support (native window controls)
+- Drag region implementation
+- UI padding adjustments untuk traffic lights
+- Discord-style window behavior
+
+### v0.2.1 - June 2026
 - UI redesign: Gradient + Glassmorphism
 - Removed video background (performance)
 - Electric blue accent color

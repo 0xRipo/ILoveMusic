@@ -1125,6 +1125,9 @@ function createWindow() {
     maxHeight: 800,
     resizable: false,
     fullscreenable: false,
+    // macOS specific: Show traffic lights (like Discord)
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 15, y: 15 },
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       webSecurity: false,
